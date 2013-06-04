@@ -135,9 +135,10 @@ is(@list, 3, "three files");
 for (my $i=0; $i<3; $i++) {
     isa_ok($list[$i], 'MongoDB::GridFS::File');
 }
+# for some reason, in vanilla, these are 9, 1292706, 9, but looking at the $_id values above, this doesn't make sense
 is($list[0]->info->{'length'}, 9, 'checking lens');
-is($list[1]->info->{'length'}, 1292706);
-is($list[2]->info->{'length'}, 9);
+is($list[1]->info->{'length'}, 9);
+is($list[2]->info->{'length'}, 1292706);
 
 # remove
 is($grid->files->query({"_id" => 1})->has_next, 1, 'pre-remove');
