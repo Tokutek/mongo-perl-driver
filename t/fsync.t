@@ -38,7 +38,7 @@ SKIP: {
     is(exists $ret->{numFiles}, 1, "fsync + async returned 'numFiles'");
 }
 
-my $is_mongos = false;
+my $is_mongos = boolean::false;
 my $ismaster = $conn->get_database('admin')->run_command({ ismaster => 1 });
 if (ref($ismaster)) {
     my $msg = $ismaster->{'msg'};

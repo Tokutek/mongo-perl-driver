@@ -24,7 +24,7 @@ else {
 
 my $db   = $conn->get_database('test_database');
 
-my $is_mongos = false;
+my $is_mongos = boolean::false;
 my $ismaster = $conn->get_database('admin')->run_command({ ismaster => 1 });
 if (ref($ismaster)) {
     my $msg = $ismaster->{'msg'};
