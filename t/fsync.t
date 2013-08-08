@@ -38,8 +38,15 @@ SKIP: {
     is(exists $ret->{numFiles}, 1, "fsync + async returned 'numFiles'");
 }
 
+my $is_mongos = false;
+my $ismaster = $conn->get_database('admin')->run_command({ ismaster => 1 });
+if (ref($ismaster)) {
+    my $msg = $ismaster->{'msg'};
+    $is_mongos = $msg =~ /isdbgrid/;
+}
+
 # Test fsync with lock.
-if ($db->run_command({ ismaster => 1 })->{'msg'} ne 'isdbgrid') {
+unless ($is_mongos) {
     $ret = $conn->fsync({lock => 1});
     is($ret->{ok},              1, "fsync + lock returned 'ok' => 1");
     is(exists $ret->{seeAlso},  1, "fsync + lock returned a link to fsync+lock documentation.");

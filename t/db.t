@@ -24,19 +24,26 @@ else {
 
 my $db   = $conn->get_database('test_database');
 
+my $is_mongos = false;
+my $ismaster = $conn->get_database('admin')->run_command({ ismaster => 1 });
+if (ref($ismaster)) {
+    my $msg = $ismaster->{'msg'};
+    $is_mongos = $msg =~ /isdbgrid/;
+}
+
 my $result = $db->run_command({reseterror => 1});
 is($result->{ok}, 1, 'reset error');
 
 $result = $db->last_error;
 is($result->{ok}, 1, 'last_error1');
-is($result->{n}, 0, 'last_error2') if ($db->run_command({ ismaster => 1 })->{'msg'} ne 'isdbgrid');
+is($result->{n}, 0, 'last_error2') unless $is_mongos;
 is($result->{err}, undef, 'last_error3');
 
 $db->run_command({forceerror => 1});
 
 $result = $db->last_error;
 is($result->{ok}, 1, 'last_error1');
-is($result->{n}, 0, 'last_error2') if ($db->run_command({ ismaster => 1 })->{'msg'} ne 'isdbgrid');
+is($result->{n}, 0, 'last_error2') unless $is_mongos;
 is($result->{err}, 'forced error', 'last_error3');
 
 my $hello = $db->eval('function(x) { return "hello, "+x; }', ["world"]);

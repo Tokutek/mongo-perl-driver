@@ -47,8 +47,15 @@ is($coll->count, 1, 'count');
 is($coll->find_one->{perl}, 'hacker', 'find_one');
 is($coll->find_one->{_id}->value, $id->value, 'insert id');
 
+my $is_mongos = false;
+my $ismaster = $conn->get_database('admin')->run_command({ ismaster => 1 });
+if (ref($ismaster)) {
+    my $msg = $ismaster->{'msg'};
+    $is_mongos = $msg =~ /isdbgrid/;
+}
+
 my $result = $db->run_command({ foo => 'bar' });
-if ($db->run_command({ ismaster => 1 })->{'msg'} eq 'isdbgrid') {
+if ($is_mongos) {
     ok ($result =~ /unrecognized command/, "run non-existent command: $result");
 } else {
     ok ($result =~ /no such cmd/, "run non-existent command: $result");
