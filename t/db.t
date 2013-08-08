@@ -29,14 +29,14 @@ is($result->{ok}, 1, 'reset error');
 
 $result = $db->last_error;
 is($result->{ok}, 1, 'last_error1');
-is($result->{n}, 0, 'last_error2');
+is($result->{n}, 0, 'last_error2') if ($db->run_command({ ismaster => 1 })->{'msg'} ne 'isdbgrid');
 is($result->{err}, undef, 'last_error3');
 
 $db->run_command({forceerror => 1});
 
 $result = $db->last_error;
 is($result->{ok}, 1, 'last_error1');
-is($result->{n}, 0, 'last_error2');
+is($result->{n}, 0, 'last_error2') if ($db->run_command({ ismaster => 1 })->{'msg'} ne 'isdbgrid');
 is($result->{err}, 'forced error', 'last_error3');
 
 my $hello = $db->eval('function(x) { return "hello, "+x; }', ["world"]);

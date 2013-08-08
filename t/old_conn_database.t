@@ -48,7 +48,11 @@ is($coll->find_one->{perl}, 'hacker', 'find_one');
 is($coll->find_one->{_id}->value, $id->value, 'insert id');
 
 my $result = $db->run_command({ foo => 'bar' });
-ok ($result =~ /no such cmd/, "run non-existent command: $result");
+if ($db->run_command({ ismaster => 1 })->{'msg'} eq 'isdbgrid') {
+    ok ($result =~ /unrecognized command/, "run non-existent command: $result");
+} else {
+    ok ($result =~ /no such cmd/, "run non-existent command: $result");
+}
 
 # getlasterror
 SKIP: {

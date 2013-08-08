@@ -39,18 +39,19 @@ SKIP: {
 }
 
 # Test fsync with lock.
-$ret = $conn->fsync({lock => 1});
-is($ret->{ok},              1, "fsync + lock returned 'ok' => 1");
-is(exists $ret->{seeAlso},  1, "fsync + lock returned a link to fsync+lock documentation.");
-is($ret->{info}, "now locked against writes, use db.fsyncUnlock() to unlock", "Successfully locked mongodb.");
+if ($db->run_command({ ismaster => 1 })->{'msg'} ne 'isdbgrid') {
+    $ret = $conn->fsync({lock => 1});
+    is($ret->{ok},              1, "fsync + lock returned 'ok' => 1");
+    is(exists $ret->{seeAlso},  1, "fsync + lock returned a link to fsync+lock documentation.");
+    is($ret->{info}, "now locked against writes, use db.fsyncUnlock() to unlock", "Successfully locked mongodb.");
 
-# Check the lock.
-$ret = $conn->get_database('admin')->get_collection('$cmd.sys.inprog')->find_one();
-is($ret->{fsyncLock}, 1, "MongoDB is still locked.");
-is($ret->{info}, "use db.fsyncUnlock() to terminate the fsync write/snapshot lock", "Got docs on how to unlock (via shell).");
+    # Check the lock.
+    $ret = $conn->get_database('admin')->get_collection('$cmd.sys.inprog')->find_one();
+    is($ret->{fsyncLock}, 1, "MongoDB is still locked.");
+    is($ret->{info}, "use db.fsyncUnlock() to terminate the fsync write/snapshot lock", "Got docs on how to unlock (via shell).");
 
-# Unlock 
-$ret = $conn->fsync_unlock(); Dumper($ret);
-is($ret->{ok}, 1, "Got 'ok' => 1 from unlock command.");
-is($ret->{info}, "unlock completed", "Got a successful unlock.");
-
+    # Unlock 
+    $ret = $conn->fsync_unlock(); Dumper($ret);
+    is($ret->{ok}, 1, "Got 'ok' => 1 from unlock command.");
+    is($ret->{info}, "unlock completed", "Got a successful unlock.");
+}
