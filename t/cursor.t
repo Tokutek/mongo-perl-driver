@@ -173,24 +173,35 @@ is($hinted, $cursor);
 
 $collection->drop;
 
-$collection->insert({'num' => 1, 'foo' => 1});
+TODO: {
+    my $is_mongos = boolean::false;
+    my $ismaster = $conn->get_database('admin')->run_command({ ismaster => 1 });
+    if (ref($ismaster)) {
+        my $msg = $ismaster->{'msg'};
+        $is_mongos = $msg =~ /isdbgrid/;
+    }
 
-my $aok = 1;
-eval {
-    $collection->query->hint({'num' => 1})->explain;
-    $aok = 0;
-};
+    todo_skip "slave_okay reads have a race due to Tokutek/mongo#77", 1 if $is_mongos;
 
-ok($@ =~ m/bad hint/);
+    $collection->insert({'num' => 1, 'foo' => 1});
 
-# MongoDB::Cursor::slave_okay
-$MongoDB::Cursor::slave_okay = 1;
-$cursor = $collection->query->next;
+    my $aok = 1;
+    eval {
+        $collection->query->hint({'num' => 1})->explain;
+        $aok = 0;
+    };
 
-$MongoDB::Cursor::slave_okay = 0;
-$cursor = $collection->query->next;
+    ok($@ =~ m/bad hint/);
 
-$collection->drop;
+    # MongoDB::Cursor::slave_okay
+    $MongoDB::Cursor::slave_okay = 1;
+    $cursor = $collection->query->next;
+
+    $MongoDB::Cursor::slave_okay = 0;
+    $cursor = $collection->query->next;
+
+    $collection->drop;
+}
 
 # count
 $coll->drop;
