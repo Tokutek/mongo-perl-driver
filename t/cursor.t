@@ -174,7 +174,6 @@ is($hinted, $cursor);
 $collection->drop;
 
 $collection->insert({'num' => 1, 'foo' => 1});
-$db->last_error({w => 'all'});
 
 my $aok = 1;
 eval {
