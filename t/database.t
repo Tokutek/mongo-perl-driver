@@ -47,17 +47,17 @@ is($coll->count, 1, 'count');
 is($coll->find_one->{perl}, 'hacker', 'find_one');
 is($coll->find_one->{_id}->value, $id->value, 'insert id');
 
-my $is_mongos = boolean::false;
-my $ismaster = $conn->get_database('admin')->run_command({ ismaster => 1 });
-if (ref($ismaster)) {
-    my $msg = $ismaster->{'msg'};
-    $is_mongos = $msg =~ /isdbgrid/;
-}
+SKIP: {
+    my $is_mongos = boolean::false;
+    my $ismaster = $conn->get_database('admin')->run_command({ ismaster => 1 });
+    if (ref($ismaster)) {
+        my $msg = $ismaster->{'msg'};
+        $is_mongos = $msg =~ /isdbgrid/;
+    }
 
-my $result = $db->run_command({ foo => 'bar' });
-if ($is_mongos) {
-    ok ($result =~ /unrecognized command/, "run non-existent command: $result");
-} else {
+    skip "mongos treats bad cmds differently", 1 if $is_mongos;
+
+    my $result = $db->run_command({ foo => 'bar' });
     ok ($result =~ /no such cmd/, "run non-existent command: $result");
 }
 

@@ -36,14 +36,20 @@ is($result->{ok}, 1, 'reset error');
 
 $result = $db->last_error;
 is($result->{ok}, 1, 'last_error1');
-is($result->{n}, 0, 'last_error2') unless $is_mongos;
+SKIP: {
+    skip "mongos doesn't return n from GLE", 1 if $is_mongos;
+    is($result->{n}, 0, 'last_error2');
+}
 is($result->{err}, undef, 'last_error3');
 
 $db->run_command({forceerror => 1});
 
 $result = $db->last_error;
 is($result->{ok}, 1, 'last_error1');
-is($result->{n}, 0, 'last_error2') unless $is_mongos;
+SKIP: {
+    skip "mongos doesn't return n from GLE", 1 if $is_mongos;
+    is($result->{n}, 0, 'last_error2');
+}
 is($result->{err}, 'forced error', 'last_error3');
 
 my $hello = $db->eval('function(x) { return "hello, "+x; }', ["world"]);
