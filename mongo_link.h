@@ -1,5 +1,5 @@
 /*
- *  Copyright 2009 10gen, Inc.
+ *  Copyright 2009 MongoDB, Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,6 +37,10 @@
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#endif
+
+#ifdef MONGO_SASL
+#include <gsasl.h>
 #endif
 
 // db ops
@@ -172,7 +176,7 @@ int perl_mongo_master(SV *self, int auto_reconnect);
 void set_disconnected(SV *link_sv);
 
 //ssl
-void perl_mongo_connect(mongo_link* link);
+void perl_mongo_connect( SV *client, mongo_link* link);
 void non_ssl_connect(mongo_link* link);
 
 #ifdef MONGO_SSL

@@ -1,5 +1,5 @@
 #
-#  Copyright 2009 10gen, Inc.
+#  Copyright 2009-2013 MongoDB, Inc.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -16,17 +16,19 @@
 
 package MongoDB::MongoClient;
 
-# ABSTRACT: A connection to a Mongo server
+# ABSTRACT: A connection to a MongoDB server
+
 use Moose;
 use Moose::Util::TypeConstraints;
 use MongoDB;
 use MongoDB::Cursor;
-
+use MongoDB::BSON::Binary;
 use Digest::MD5;
 use Tie::IxHash;
-use Carp 'carp';
+use Carp 'carp', 'croak';
+use Scalar::Util 'reftype';
 use boolean;
-
+use Encode;
 
 has host => (
     is       => 'ro',
@@ -131,6 +133,19 @@ has ssl => (
     default  => 0,
 );
 
+has sasl => ( 
+    is       => 'ro',
+    isa      => 'Bool',
+    required => 1,
+    default  => 0
+);
+
+has sasl_mechanism => ( 
+    is       => 'ro',
+    isa      => subtype( Str => where { /^GSSAPI|PLAIN$/ } ),
+    required => 1,
+    default  => 'GSSAPI',
+);
 
 # hash of servers in a set
 # call connected() to determine if a connection is enabled
@@ -183,7 +198,7 @@ sub BUILD {
                / ([^?]*) # /[database]
                 (?: [?] (.*) )? # [?options]
             )?
-            $ }x) {
+            $ }x ) {
         my ($username, $password, $hostpairs, $database, $options) = ($1, $2, $3, $4, $5);
 
         # we add these things to $opts as well as self so that they get propagated when we recurse for multiple servers
@@ -434,6 +449,71 @@ sub fsync_unlock {
     return $self->get_database('admin')->get_collection('$cmd.sys.unlock')->find_one();
 }
 
+sub _w_want_safe { 
+    my ( $self ) = @_;
+
+    my $w = $self->w;
+
+    return 0 if $w =~ /^-?\d+$/ && $w <= 0;
+    return 1;
+}
+
+sub _sasl_check { 
+    my ( $self, $res ) = @_;
+
+    die "Invalid SASL response document from server:"
+        unless reftype $res eq reftype { };
+
+    if ( $res->{ok} != 1 ) { 
+        die "SASL authentication error: $res->{errmsg}";
+    }
+
+    return $res->{conversationId};
+}
+
+sub _sasl_start { 
+    my ( $self, $payload, $mechanism ) = @_;
+
+    # warn "SASL start, payload = [$payload], mechanism = [$mechanism]\n";
+
+    my $res = $self->get_database( '$external' )->run_command( [ 
+        saslStart     => 1,
+        mechanism     => $mechanism,
+        payload       => $payload,
+        autoAuthorize => 1 ] );
+
+    $self->_sasl_check( $res );
+    return $res;
+}
+
+
+sub _sasl_continue { 
+    my ( $self, $payload, $conv_id ) = @_;
+
+    # warn "SASL continue, payload = [$payload], conv ID = [$conv_id]";
+
+    my $res = $self->get_database( '$external' )->run_command( [ 
+        saslContinue     => 1,
+        conversationId   => $conv_id,
+        payload          => $payload
+    ] );
+
+    $self->_sasl_check( $res );
+    return $res;
+}
+
+
+sub _sasl_plain_authenticate { 
+    my ( $self ) = @_;
+
+    my $username = defined $self->username ? $self->username : "";
+    my $password = defined $self->password ? $self->password : ""; 
+
+    my $auth_bytes = encode( "UTF-8", "\x00" . $username . "\x00" . $password );
+    my $payload = MongoDB::BSON::Binary->new( data => $auth_bytes ); 
+
+    $self->_sasl_start( $payload, "PLAIN" );    
+} 
 
 __PACKAGE__->meta->make_immutable( inline_destructor => 0 );
 
@@ -443,9 +523,7 @@ __PACKAGE__->meta->make_immutable( inline_destructor => 0 );
 
 __END__
 
-=head1 NAME
-
-MongoDB::MongoClient - A client object for a MongoDB server
+=pod
 
 =head1 SYNOPSIS
 
@@ -463,18 +541,16 @@ It can connect to a database server running anywhere, though:
 
 See the L</"host"> section for more options for connecting to MongoDB.
 
-=head2 Multithreading
+=head1 MULTITHREADING
 
 Cloning instances of this class is disabled in Perl 5.8.7+, so forked threads
 will have to create their own connections to the database.
 
 =head1 SEE ALSO
 
-Core documentation on connections: L<http://dochub.mongodb.org/core/connections>.
+Core documentation on connections: L<http://docs.mongodb.org/manual/reference/connection-string/>.
 
-=head1 ATTRIBUTES
-
-=head2 host
+=attr host
 
 Server or servers to connect to. Defaults to C<mongodb://localhost:27017>.
 
@@ -504,7 +580,7 @@ into the database as well as connect.  By default, the driver will attempt to
 authenticate with the admin database.  If a different database is specified
 using the C<db_name> property, it will be used instead.
 
-=head2 w
+=attr w
 
 The client I<write concern>. 
 
@@ -536,7 +612,7 @@ rules on how your data is replicated. To used you getLastErrorMode, you pass in 
 name of the mode to the C<w> parameter. For more infomation see: 
 http://www.mongodb.org/display/DOCS/Data+Center+Awareness
 
-=head2 wtimeout
+=attr wtimeout
 
 The number of milliseconds an operation should wait for C<w> slaves to replicate
 it.
@@ -545,44 +621,44 @@ Defaults to 1000 (1 second).
 
 See C<w> above for more information.
 
-=head2 j
+=attr j
 
 If true, awaits the journal commit before returning. If the server is running without 
 journaling, it returns immediately, and successfully.
 
 
-=head2 auto_reconnect
+=attr auto_reconnect
 
 Boolean indicating whether or not to reconnect if the connection is
 interrupted. Defaults to C<1>.
 
-=head2 auto_connect
+=attr auto_connect
 
 Boolean indication whether or not to connect automatically on object
 construction. Defaults to C<1>.
 
-=head2 timeout
+=attr timeout
 
 Connection timeout in milliseconds. Defaults to C<20000>.
 
-=head2 username
+=attr username
 
 Username for this client connection.  Optional.  If this and the password field are
 set, the client will attempt to authenticate on connection/reconnection.
 
-=head2 password
+=attr password
 
 Password for this connection.  Optional.  If this and the username field are
 set, the client will attempt to authenticate on connection/reconnection.
 
-=head2 db_name
+=attr db_name
 
 Database to authenticate on for this connection.  Optional.  If this, the
 username, and the password fields are set, the client will attempt to
 authenticate against this database on connection/reconnection.  Defaults to
 "admin".
 
-=head2 query_timeout
+=attr query_timeout
 
     # set query timeout to 1 second
     my $client = MongoDB::MongoClient->new(query_timeout => 1000);
@@ -609,12 +685,12 @@ This value overrides L<MongoDB::Cursor/timeout>.
     my $client = MongoDB::MongoClient->new(query_timeout => 10);
     # timeout for $conn is 10 milliseconds
 
-=head2 max_bson_size
+=attr max_bson_size
 
 This is the largest document, in bytes, storable by MongoDB. The driver queries
 MongoDB on connection to determine this value.  It defaults to 4MB.
 
-=head2 find_master
+=attr find_master
 
 If this is true, the driver will attempt to find a primary given the list of
 hosts.  The primary-finding algorithm looks like:
@@ -644,50 +720,101 @@ You can use the C<ismaster> command to find the members of a replica set:
 The primary and secondary hosts are listed in the C<hosts> field, the slaves are
 in the C<passives> field, and arbiters are in the C<arbiters> field.
 
-=head2 ssl
+=attr ssl
 
 This tells the driver that you are connecting to an SSL mongodb instance.
 
 This option will be ignored if the driver was not compiled with the SSL flag. You must
 also be using a database server that supports SSL.
 
+The driver must be built as follows for SSL support:
 
-=head2 dt_type
+    perl Makefile.PL --ssl
+    make
+    make install
+
+Alternatively, you can set the C<PERL_MONGODB_WITH_SSL> environment variable before
+installing:
+
+    PERL_MONGODB_WITH_SSL=1 cpan MongoDB
+
+The C<libcrypto> and C<libssl> libraries are required for SSL support.
+
+=attr sasl
+
+This attribute is experimental.
+
+If set to C<1>, the driver will attempt to negotiate SASL authentication upon
+connection. See L</sasl_mechanism> for a list of the currently supported mechanisms. The
+driver must be built as follows for SASL support:
+
+    perl Makefile.PL --sasl
+    make
+    make install
+
+Alternatively, you can set the C<PERL_MONGODB_WITH_SASL> environment variable before
+installing:
+
+    PERL_MONGODB_WITH_SASL=1 cpan MongoDB
+
+The C<libgsasl> library is required for SASL support. RedHat/CentOS users can find it
+in the EPEL repositories.
+
+Future versions of this driver may switch to L<Cyrus SASL|http://www.cyrusimap.org/docs/cyrus-sasl/2.1.25/>
+in order to be consistent with the MongoDB server, which now uses Cyrus.
+
+=attr sasl_mechanism
+
+This attribute is experimental.
+
+This specifies the SASL mechanism to use for authentication with a MongoDB server. (See L</sasl>.) 
+The default is GSSAPI. The supported SASL mechanisms are:
+
+=over 4
+
+=item * C<GSSAPI>. This is the default. GSSAPI will attempt to authenticate against Kerberos
+for MongoDB Enterprise 2.4+. You must run your program from within a C<kinit> session and set 
+the C<username> attribute to the Kerberos principal name, e.g. C<user@EXAMPLE.COM>. 
+
+=item * C<PLAIN>. The SASL PLAIN mechanism will attempt to authenticate against LDAP for
+MongoDB Enterprise 2.6+. Because the password is not encrypted, you should only use this
+mechanism over a secure connection. You must set the C<username> and C<password> attributes 
+to your LDAP credentials.
+
+=back
+
+=attr dt_type
 
 Sets the type of object which is returned for DateTime fields. The default is L<DateTime>. Other
 acceptable values are L<DateTime::Tiny> and C<undef>. The latter will give you the raw epoch value
 rather than an object.
 
-=head2 inflate_dbrefs
+=attr inflate_dbrefs
 
 Controls whether L<DBRef|http://docs.mongodb.org/manual/applications/database-references/#dbref>s 
 are automatically inflated into L<MongoDB::DBRef> objects. Defaults to true.
 Set this to C<0> if you don't want to auto-inflate them.
 
-
-=head1 METHODS
-
-=head2 connect
+=method connect
 
     $client->connect;
 
 Connects to the MongoDB server. Called automatically on object construction if
-C<auto_connect> is true.
+L</auto_connect> is true.
 
-=head2 database_names
+=method database_names
 
     my @dbs = $client->database_names;
 
-Lists all databases on the mongo server.
+Lists all databases on the MongoDB server.
 
-=head2 get_database($name)
+=method get_database($name)
 
     my $database = $client->get_database('foo');
 
-Returns a L<MongoDB::Database> instance for database with the given C<$name>.
+Returns a L<MongoDB::Database> instance for the database with the given C<$name>.
 
-
-=head2 get_master
+=method get_master
 
     $master = $client->get_master
 
@@ -696,7 +823,7 @@ a non-paired connection.  This need never be invoked by a user, it is
 called automatically by internal functions.  Returns the index of the master
 connection in the list of connections or -1 if it cannot be determined.
 
-=head2 authenticate ($dbname, $username, $password, $is_digest?)
+=method authenticate ($dbname, $username, $password, $is_digest?)
 
     $client->authenticate('foo', 'username', 'secret');
 
@@ -706,10 +833,10 @@ automatically hashed before sending over the wire, unless C<$is_digest> is
 true, which will assume you already did the hashing on yourself.
 
 See also the core documentation on authentication:
-L<http://dochub.mongodb.org/core/authentication>.
+L<http://docs.mongodb.org/manual/core/access-control/>.
 
 
-=head2 send($str)
+=method send($str)
 
     my ($insert, $ids) = MongoDB::write_insert('foo.bar', [{name => "joe", age => 40}]);
     $client->send($insert);
@@ -718,7 +845,7 @@ Low-level function to send a string directly to the database.  Use
 L<MongoDB::write_insert>, L<MongoDB::write_update>, L<MongoDB::write_remove>, or
 L<MongoDB::write_query> to create a valid string.
 
-=head2 recv(\%info)
+=method recv(\%info)
 
     my $cursor = $client->recv({ns => "foo.bar"});
 
@@ -728,7 +855,7 @@ C<MongoDB::Cursor>.  At the moment, the only required field for C<$info> is
 C<$info> hash will be automatically created for you by L<MongoDB::write_query>.
 
 
-=head2 fsync(\%args)
+=method fsync(\%args)
 
     $client->fsync();
 
@@ -742,7 +869,7 @@ The primary use of fsync is to lock the database during backup operations. This 
 
     $conn->fsync({lock => 1});
 
-=head2 fsync_unlock
+=method fsync_unlock
 
     $conn->fsync_unlock();
 

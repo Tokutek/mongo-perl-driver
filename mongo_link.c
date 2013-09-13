@@ -1,5 +1,5 @@
 /*
- *  Copyright 2009 10gen, Inc.
+ *  Copyright 2009-2013 MongoDB, Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,20 +28,106 @@ static int mongo_link_timeout(int socket, time_t timeout);
 
 static void set_timeout(int socket, time_t timeout) {
 #ifdef WIN32
-  DWORD tv = (DWORD)timeout * 1000;
+  DWORD tv = (DWORD)timeout;
   const char *tv_ptr = (const char*)&tv;
 #else
   struct timeval tv;
-  tv.tv_sec = timeout;
-  tv.tv_usec = 0;
+  tv.tv_sec = timeout / 1000;
+  tv.tv_usec = (timeout % 1000) * 1000;
   const void *tv_ptr = (void*)&tv;
 #endif
   setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, tv_ptr, sizeof(tv));
   setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, tv_ptr, sizeof(tv));
 }
 
+#ifdef MONGO_SASL
+static void sasl_authenticate( SV *client, mongo_link *link ) { 
+  Gsasl *ctx = NULL;
+  Gsasl_session *session;
+  SV *username, *mechanism, *conv_id;
+  HV *result;       /* response document from mongod */
+  char *p, *buf;    /* I/O buffers for gsasl */
+  int rc;
+  char out_buf[8192];
 
-void perl_mongo_connect(mongo_link* link) {
+  mechanism = perl_mongo_call_method( client, "sasl_mechanism", 0, 0 );
+  if ( !SvOK( mechanism ) ) { 
+    croak( "MongoDB: Could not retrieve SASL mechanism from client object\n" );
+  }
+
+  if ( strncmp( "PLAIN", SvPV_nolen( mechanism ), 5 ) == 0 ) { 
+    /* SASL PLAIN does not require a libgsasl conversation loop, so we can handle it elsewhere */
+    return perl_mongo_call_method( client, "_sasl_plain_authenticate", 0, 0 );
+  }
+
+  if ( ( rc = gsasl_init( &ctx ) ) != GSASL_OK ) { 
+    croak( "MongoDB: Cannot initialize libgsasl (%d): %s\n", rc, gsasl_strerror(rc) );  
+  }
+
+  if ( ( rc = gsasl_client_start( ctx, SvPV_nolen( mechanism ), &session ) ) != GSASL_OK ) { 
+    croak( "MongoDB: Cannot initialize SASL client (%d): %s\n", rc, gsasl_strerror(rc) );
+  }
+
+  username = perl_mongo_call_method( client, "username", 0, 0 );
+  if ( !SvOK( username ) ) { 
+    croak( "MongoDB: Cannot start SASL session without username. Specify username in constructor\n" );
+  }
+ 
+  gsasl_property_set( session, GSASL_SERVICE,  "mongodb" );
+  gsasl_property_set( session, GSASL_HOSTNAME, link->master->host );
+  gsasl_property_set( session, GSASL_AUTHID,   SvPV_nolen( username ) ); 
+
+  rc = gsasl_step64( session, "", &p );
+  if ( ( rc != GSASL_OK ) && ( rc != GSASL_NEEDS_MORE ) ) { 
+    croak( "MongoDB: No data from GSSAPI. Did you run kinit?\n" );
+  }
+
+  if ( ! strncpy( out_buf, p, 8192 ) ) {
+    croak( "MongoDB: Unable to copy SASL output buffer\n" );
+  }
+  gsasl_free( p );
+
+  result = (HV *)SvRV( perl_mongo_call_method( client, "_sasl_start", 0, 2, newSVpv( out_buf, 0 ), mechanism ) );
+
+#if 0  
+  fprintf( stderr, "result conv id = [%s]\n", SvPV_nolen( *hv_fetch( result, "conversationId", 14, FALSE ) ) );
+  fprintf( stderr, "result payload = [%s]\n", SvPV_nolen( *hv_fetch( result, "payload",         7, FALSE ) ) );
+#endif
+
+  buf = SvPV_nolen( *hv_fetch( result, "payload", 7, FALSE ) );
+  conv_id = *hv_fetch( result, "conversationId", 14, FALSE ); 
+ 
+  do { 
+    rc = gsasl_step64( session, buf, &p );
+    if ( ( rc != GSASL_OK ) && ( rc != GSASL_NEEDS_MORE ) ) {
+      croak( "MongoDB: SASL step error (%d): %s\n", rc, gsasl_strerror(rc) );
+    }
+
+    if ( ! strncpy( out_buf, p, 8192 ) ) { 
+      croak( "MongoDB: Unable to copy SASL output buffer\n" );
+    }
+    gsasl_free( p );
+
+    result = (HV *)SvRV( perl_mongo_call_method( client, "_sasl_continue", 0, 2, newSVpv( out_buf, 0 ), conv_id ) );
+#if 0 
+    fprintf( stderr, "result conv id = [%s]\n", SvPV_nolen( *hv_fetch( result, "conversationId", 14, FALSE ) ) );
+    fprintf( stderr, "result payload = [%s]\n", SvPV_nolen( *hv_fetch( result, "payload",         7, FALSE ) ) );
+#endif
+
+    buf = SvPV_nolen( *hv_fetch( result, "payload", 7, FALSE ) );
+
+  } while( rc == GSASL_NEEDS_MORE );
+
+  if ( rc != GSASL_OK ) { 
+    croak( "MongoDB: SASL Authentication error (%d): %s\n", rc, gsasl_strerror(rc) );
+  }
+
+  gsasl_finish( session );
+  gsasl_done( ctx );
+}
+#endif  /* MONGO_SASL */
+
+void perl_mongo_connect(SV *client, mongo_link* link) {
 #ifdef MONGO_SSL
   if(link->ssl){
     ssl_connect(link);
@@ -54,6 +140,16 @@ void perl_mongo_connect(mongo_link* link) {
   non_ssl_connect(link);
   link->sender = non_ssl_send;
   link->receiver = non_ssl_recv;
+
+  IV sasl_flag = SvIV( perl_mongo_call_method( client, "sasl", 0, 0 ) );
+
+  if ( sasl_flag == 1 ) { 
+#ifdef MONGO_SASL
+      sasl_authenticate( client, link );
+#else
+      croak( "MongoDB: sasl => 1 specified, but this driver was not compiled with SASL support\n" );
+#endif
+  }
 }
 
 /*

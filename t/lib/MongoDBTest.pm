@@ -1,5 +1,5 @@
 #
-#  Copyright 2009-2013 MongoDB, Inc.
+#  Copyright 2009-2013 10gen, Inc.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -15,23 +15,38 @@
 #
 
 
+
+package MongoDBTest;
+
 use strict;
 use warnings;
+
+use Exporter 'import';
+use MongoDB;
 use Test::More;
 
-use MongoDB::Timestamp; # needed if db is being run as master
-use MongoDB;
-use DateTime;
-use DateTime::Tiny;
+our @EXPORT_OK = ( '$conn' );
+our $conn;
 
-use lib "t/lib";
-use MongoDBTest '$conn';
+# set up connection if we can
+BEGIN { 
+    eval { 
+        my $host = exists $ENV{MONGOD} ? $ENV{MONGOD} : 'localhost';
+        $conn = MongoDB::MongoClient->new( host => $host, ssl => $ENV{MONGO_SSL} );
+    };
 
-plan skip_all => "connecting to default host/port won't work with a remote db" if exists $ENV{MONGOD};
+    if ( $@ ) { 
+        plan skip_all => $@;
+        exit 0;
+    }
+};
 
-plan tests => 1;
 
-# test that Connection delegates constructor params to MongoClient correctly
-my $conn2 = MongoDB::Connection->new( host => '127.0.0.1' );
+# clean up any detritus from failed tests
+END { 
+    return unless $conn;
 
-is ( $conn2->host, '127.0.0.1' );
+    $conn->get_database( 'test_database' )->drop;
+};
+
+

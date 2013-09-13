@@ -1,3 +1,20 @@
+#
+#  Copyright 2009-2013 MongoDB, Inc.
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#  http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+#
+
+
 use strict;
 use warnings;
 use Test::More;
@@ -12,21 +29,10 @@ use MongoDB::Timestamp; # needed if db is being run as master
 
 use MongoDB;
 
-my $conn;
-eval {
-    my $host = "localhost";
-    if (exists $ENV{MONGOD}) {
-        $host = $ENV{MONGOD};
-    }
-    $conn = MongoDB::MongoClient->new(host => $host, ssl => $ENV{MONGO_SSL});
-};
+use lib "t/lib";
+use MongoDBTest '$conn';
 
-if ($@) {
-    plan skip_all => $@;
-}
-else {
-    plan tests => 141;
-}
+plan tests => 141;
 
 my $db = $conn->get_database('test_database');
 $db->drop;
@@ -119,7 +125,7 @@ is($coll->count, 2);
 
 $ok = $coll->ensure_index({boo => 1}, {unique => 1});
 ok(!defined $ok);
-$coll->insert({foo => 3, bar => 3, baz => 3, boo => 2});
+eval { $coll->insert({foo => 3, bar => 3, baz => 3, boo => 2}) };
 
 is($coll->count, 2, 'unique index');
 
@@ -155,7 +161,7 @@ $coll->drop;
 {
     $ok = $coll->ensure_index({foo => 1, bar => -1, baz => 1});
     ok(!defined $ok);
-    $ok = $coll->ensure_index({foo => 1, bar => 1});
+    $ok = $coll->ensure_index([foo => 1, bar => 1]);
     ok(!defined $ok);
     $coll->insert({foo => 1, bar => 1, baz => 1, boo => 1});
     $coll->insert({foo => 1, bar => 1, baz => 1, boo => 2});
@@ -163,7 +169,7 @@ $coll->drop;
 
     # unique index
     $coll->ensure_index({boo => 1}, {unique => 1});
-    $coll->insert({foo => 3, bar => 3, baz => 3, boo => 2});
+    eval { $coll->insert({foo => 3, bar => 3, baz => 3, boo => 2}) };
     is($coll->count, 2, 'unique index');
 }
 $coll->drop;
@@ -429,7 +435,7 @@ SKIP: {
 
     $coll->insert({x=>1});
     $ok = $coll->update({}, {'$inc' => {x => 1}});
-    is($ok, 1);
+    is($ok->{ok}, 1);
 
     $ok = $coll->update({}, {'$inc' => {x => 2}}, {safe => 1});
     is($ok->{ok}, 1);
@@ -515,7 +521,7 @@ SKIP: {
     }
     is($coll->count, 20);
 
-    $coll->ensure_index({"y" => 1}, {"unique" => 1, "name" => "foo"});
+    eval { $coll->ensure_index({"y" => 1}, {"unique" => 1, "name" => "foo"}) };
     my $index = $coll->_database->get_collection("system.indexes")->find_one({"name" => "foo"});
     ok(!$index);
 

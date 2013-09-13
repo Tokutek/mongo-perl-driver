@@ -14,36 +14,33 @@
 #  limitations under the License.
 #
 
-
 use strict;
 use warnings;
+use Test::More;
+use Test::Exception;
+
 use MongoDB;
-use boolean;
-use Data::Dumper;
-use MongoDB::OID;
-use Devel::Peek;
-use Data::Dump;
 
-my $m = MongoDB::MongoClient->new(host => "mongodb://localhost:27018", find_master => 1, ssl => $ENV{MONGO_SSL});
+use lib "t/lib";
+use MongoDBTest '$conn';
 
-my $db = $m->get_database("admin");
-my $c = $db->get_collection("bar");
+plan tests => 6;
 
-while (true) {
-#   print "finding...";
-   eval {
-       $c->find_one();
-   };
-   if ($@) {
-       print $@;
-   }
-   else {
-       if ($m->_master){
-           print "connected to: ".$m->_master->{host}."\n";
-       }
-       else {
-           print "no master\n";
-       }
-   }
-   sleep 1;
-}
+
+$conn->w( -1 );
+is( $conn->_w_want_safe, 0 );
+
+$conn->w( 0 );
+is( $conn->_w_want_safe, 0 );
+
+$conn->w( 1 );
+is( $conn->_w_want_safe, 1 );
+
+$conn->w( 'all' );
+is( $conn->_w_want_safe, 1 );
+
+$conn->w( 'majority' );
+is( $conn->_w_want_safe, 1 );
+
+$conn->w( 'anything' );
+is( $conn->_w_want_safe, 1 );

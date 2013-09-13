@@ -1,5 +1,5 @@
 #
-#  Copyright 2009 10gen, Inc.
+#  Copyright 2009-2013 MongoDB, Inc.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -16,7 +16,8 @@
 
 package MongoDB::Connection;
 
-# ABSTRACT: A connection to a Mongo server
+# ABSTRACT: A connection to a MongoDB server (DEPRECATED)
+
 use Moose;
 
 use MongoDB;
@@ -70,9 +71,7 @@ __PACKAGE__->meta->make_immutable ( inline_destructor => 0, inline_constructor =
 
 __END__
 
-=head1 NAME
-
-MongoDB::Connection - A connection to a MongoDB server
+=pod
 
 =head1 DEPRECATED
 
@@ -95,7 +94,7 @@ It can connect to a database server running anywhere, though:
 
 See the L</"host"> section for more options for connecting to MongoDB.
 
-=head2 Multithreading
+=head2 MULTITHREADING
 
 Cloning instances of this class is disabled in Perl 5.8.7+, so forked threads
 will have to create their own connections to the database.
@@ -177,7 +176,7 @@ safe insert times out and croaks.
 I<MongoDB server version 2.0+: "majority" and Data Center Awareness>
 
 As of MongoDB 2.0+, the 'w' parameter can be passed strings. This can be done by passing it the string "majority" this will wait till the B<majority> of 
-of the nodes in the relica set have recieved the data. For more information see: http://www.mongodb.org/display/DOCS/getLastError+Command#getLastErrorCommand-majority
+of the nodes in the replica set have recieved the data. For more information see: http://www.mongodb.org/display/DOCS/getLastError+Command#getLastErrorCommand-majority
 
 This can be useful for "Data Center Awareness." In v2.0+, you can "tag" replica members. With "tagging" you can specify a new "getLastErrorMode" where you can create new
 rules on how your data is replicated. To used you getLastErrorMode, you pass in the name of the mode to the 'w' parameter. For more infomation see: http://www.mongodb.org/display/DOCS/Data+Center+Awareness
