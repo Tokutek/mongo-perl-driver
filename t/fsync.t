@@ -48,8 +48,7 @@ SKIP: {
     my $is_mongos = boolean::false;
     my $ismaster = $conn->get_database('admin')->run_command({ ismaster => 1 });
     if (ref($ismaster)) {
-        my $msg = $ismaster->{'msg'};
-        $is_mongos = $msg =~ /isdbgrid/;
+        $is_mongos = exists $ismaster->{'msg'} and $ismaster->{'msg'} =~ /isdbgrid/;
     }
 
     skip "mongos doesn't support fsyncLock", 7 if $is_mongos;

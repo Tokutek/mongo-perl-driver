@@ -184,8 +184,7 @@ TODO: {
     my $is_mongos = boolean::false;
     my $ismaster = $conn->get_database('admin')->run_command({ ismaster => 1 });
     if (ref($ismaster)) {
-        my $msg = $ismaster->{'msg'};
-        $is_mongos = $msg =~ /isdbgrid/;
+        $is_mongos = exists $ismaster->{'msg'} and $ismaster->{'msg'} =~ /isdbgrid/;
     }
 
     todo_skip "slave_okay reads have a race due to Tokutek/mongo#77", 1 if $is_mongos;
