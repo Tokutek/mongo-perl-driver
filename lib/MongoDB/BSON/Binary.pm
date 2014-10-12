@@ -19,7 +19,11 @@ package MongoDB::BSON::Binary;
 
 # ABSTRACT: Binary type
 
+use version;
+our $VERSION = 'v0.704.5.1';
+
 use Moose;
+use namespace::clean -except => 'meta';
 
 =head1 NAME
 
@@ -134,6 +138,8 @@ This should not affect Perl users at all, as Perl does not deserialize it into
 any native UUID type.
 
 =cut
+
+__PACKAGE__->meta->make_immutable;
 
 1;
 

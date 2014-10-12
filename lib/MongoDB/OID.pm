@@ -18,7 +18,12 @@ package MongoDB::OID;
 
 # ABSTRACT: A Mongo Object ID
 
+use version;
+our $VERSION = 'v0.704.5.1';
+
 use Moose;
+use MongoDB;
+use namespace::clean -except => 'meta';
 
 =head1 NAME
 
@@ -31,7 +36,7 @@ C<_id> field will be added with a new C<MongoDB::OID> as its value.
 
     my $id = $collection->insert({'name' => 'Alice', age => 20});
 
-C<$id> will be a C<MongoDB::OID> that can be used to retreive or update the 
+C<$id> will be a C<MongoDB::OID> that can be used to retrieve or update the 
 saved document:
 
     $collection->update({_id => $id}, {'age' => {'$inc' => 1}});
@@ -117,6 +122,13 @@ sub get_time {
     my ($self) = @_;
 
     return hex(substr($self->value, 0, 8));
+}
+
+# for testing purposes
+sub _get_pid {
+    my ($self) = @_;
+
+    return hex(substr($self->value, 14, 4));
 }
 
 =head2 TO_JSON

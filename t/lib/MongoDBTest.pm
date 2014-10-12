@@ -1,5 +1,5 @@
 #
-#  Copyright 2009-2013 10gen, Inc.
+#  Copyright 2009-2013 MongoDB, Inc.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -24,29 +24,84 @@ use warnings;
 use Exporter 'import';
 use MongoDB;
 use Test::More;
+use version;
 
-our @EXPORT_OK = ( '$conn' );
-our $conn;
+our @EXPORT_OK = ( 'build_client', 'get_test_db', 'server_version', 'server_type' );
+my @testdbs;
 
-# set up connection if we can
-BEGIN { 
-    eval { 
-        my $host = exists $ENV{MONGOD} ? $ENV{MONGOD} : 'localhost';
-        $conn = MongoDB::MongoClient->new( host => $host, ssl => $ENV{MONGO_SSL} );
+# abstract building a connection
+sub build_client {
+    my @args = @_;
+    my $host = exists $ENV{MONGOD} ? $ENV{MONGOD} : 'localhost';
+
+    # long query timeout may help spurious failures on heavily loaded CI machines
+    return MongoDB::MongoClient->new(
+        host => $host, ssl => $ENV{MONGO_SSL}, find_master => 1, query_timeout => 60000, @args,
+    );
+}
+
+sub get_test_db {
+
+    my $conn = shift;
+    my $testdb = 'testdb' . int(rand(2**31));
+    my $db = $conn->get_database($testdb) or die "Can't get database\n";
+    push(@testdbs, $db);
+    return  $db;
+}
+
+
+BEGIN {
+    eval {
+        my $conn = build_client();
+        my $testdb = get_test_db($conn);
+        eval { $conn->get_database("admin")->_try_run_command({ serverStatus => 1 }) }
+            or die "Database has auth enabled\n";
     };
 
-    if ( $@ ) { 
-        plan skip_all => $@;
-        exit 0;
+    if ( $@ ) {
+        (my $err = $@) =~ s/\n//g;
+        if ( $err =~ /couldn't connect/ ) {
+            $err = "no mongod on " . ($ENV{MONGOD} || "localhost:27017");
+            $err .= ' and $ENV{MONGOD} not set' unless $ENV{MONGOD};
+        }
+        plan skip_all => "$err";
     }
 };
 
+sub server_version {
 
-# clean up any detritus from failed tests
-END { 
-    return unless $conn;
+    my $conn = shift;
+    my $build = $conn->get_database( 'admin' )->get_collection( '$cmd' )->find_one( { buildInfo => 1 } );
+    my ($version_str) = $build->{version} =~ m{^([0-9.]+)};
+    return version->parse("v$version_str");
+}
 
-    $conn->get_database( 'test_database' )->drop;
-};
+sub server_type {
 
+    my $conn = shift;
+    my $server_type;
 
+    # check database type
+    my $ismaster = $conn->get_database('admin')->_try_run_command({ismaster => 1});
+    if (exists $ismaster->{msg} && $ismaster->{msg} eq 'isdbgrid') {
+        $server_type = 'Mongos';
+    }
+    elsif ( $ismaster->{ismaster} && exists $ismaster->{setName} ) {
+        $server_type = 'RSPrimary'
+    }
+    elsif ( ! exists $ismaster->{setName} && ! $ismaster->{isreplicaset} ) {
+        $server_type = 'Standalone'
+    }
+    else {
+        $server_type = 'Unknown';
+    }
+}
+
+# cleanup test dbs
+END {
+    for my $db (@testdbs) {
+        $db->drop;
+    }
+}
+
+1;

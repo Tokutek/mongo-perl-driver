@@ -18,23 +18,14 @@ package MongoDB::DBRef;
 
 # ABSTRACT: Native DBRef support
 
-use Moose;
-use Moose::Util::TypeConstraints;
+use version;
+our $VERSION = 'v0.704.5.1';
+
 use Carp 'croak';
 use Tie::IxHash;
-
-
-subtype DBRefColl => as 'Str';
-subtype DBRefDB   => as 'Str';
-
-coerce 'DBRefColl'
-  => from 'MongoDB::Collection'
-  => via  { $_->name };
-
-coerce 'DBRefDB' 
-  => from 'MongoDB::Database'
-  => via  { $_->name };
-
+use Moose;
+use MongoDB::_Types;
+use namespace::clean -except => 'meta';
 
 # no type constraint since an _id can be anything
 has id => (
@@ -109,6 +100,8 @@ sub _ordered {
     
     return Tie::IxHash->new( '$ref' => $self->ref, '$id' => $self->id, '$db' => $self->db );
 }
+
+__PACKAGE__->meta->make_immutable;
 
 1;
 

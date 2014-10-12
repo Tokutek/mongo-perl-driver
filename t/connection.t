@@ -18,7 +18,7 @@
 use strict;
 use warnings;
 use Test::More;
-use Test::Exception;
+use Test::Fatal;
 use Test::Warn;
 
 use MongoDB::Timestamp; # needed if db is being run as master
@@ -26,20 +26,26 @@ use MongoDB::Timestamp; # needed if db is being run as master
 use MongoDB;
 
 use lib "t/lib";
-use MongoDBTest '$conn';
+use MongoDBTest qw/build_client get_test_db/;
 
-plan tests => 27;
+my $conn = build_client();
+my $testdb = get_test_db($conn);
 
-throws_ok {
-    MongoDB::MongoClient->new(host => 'localhost', port => 1, ssl => $ENV{MONGO_SSL});
-} qr/couldn't connect to server/, 'exception on connection failure';
+like(
+    exception { MongoDB::MongoClient->new(host => 'localhost', port => 1, ssl => $ENV{MONGO_SSL}); },
+    qr/couldn't connect to server/,
+    'exception on connection failure'
+);
 
 SKIP: {
     skip "connecting to default host/port won't work with a remote db", 13 if exists $ENV{MONGOD};
 
-    lives_ok {
-        $conn = MongoDB::MongoClient->new(ssl => $ENV{MONGO_SSL});
-    } 'successful connection';
+    is(
+        exception { $conn = MongoDB::MongoClient->new(ssl => $ENV{MONGO_SSL}); },
+        undef,
+        'successful connection'
+    ) ;
+
     isa_ok($conn, 'MongoDB::MongoClient');
 
     is($conn->host, 'mongodb://localhost:27017', 'host default value');
@@ -51,22 +57,30 @@ SKIP: {
     $to = MongoDB::MongoClient->new('timeout' => 2000000, ssl => $ENV{MONGO_SSL});
 
     # test conn format
-    lives_ok {
-        $conn = MongoDB::MongoClient->new("host" => "mongodb://localhost:27017", ssl => $ENV{MONGO_SSL});
-    } 'connected';
+    is(
+        exception { $conn = MongoDB::MongoClient->new("host" => "mongodb://localhost:27017", ssl => $ENV{MONGO_SSL}); },
+        undef,
+        'connected'
+    );
 
-    lives_ok {
-        $conn = MongoDB::MongoClient->new("host" => "mongodb://localhost:27017,", ssl => $ENV{MONGO_SSL});
-    } 'extra comma';
+    is(
+        exception { $conn = MongoDB::MongoClient->new("host" => "mongodb://localhost:27017,", ssl => $ENV{MONGO_SSL}); },
+        undef,
+        'extra comma'
+    );
 
-    lives_ok {
-        my $ip = 27020;
-        while ((exists $ENV{DB_PORT} && $ip eq $ENV{DB_PORT}) ||
-               (exists $ENV{DB_PORT2} && $ip eq $ENV{DB_PORT2})) {
-            $ip++;
-        }
-        my $conn2 = MongoDB::MongoClient->new("host" => "mongodb://localhost:".$ip.",localhost:".($ip+1).",localhost", ssl => $ENV{MONGO_SSL});
-    } 'last in line';
+    is(
+        exception {
+            my $ip = 27020;
+            while ((exists $ENV{DB_PORT} && $ip eq $ENV{DB_PORT}) ||
+                (exists $ENV{DB_PORT2} && $ip eq $ENV{DB_PORT2})) {
+                $ip++;
+            }
+            my $conn2 = MongoDB::MongoClient->new("host" => "mongodb://localhost:".$ip.",localhost:".($ip+1).",localhost", ssl => $ENV{MONGO_SSL});
+        },
+        undef,
+        'last in line'
+    );
 
     is(MongoDB::MongoClient->new('host' => 'mongodb://localhost/example_db')->db_name, 'example_db', 'connection uri database');
     is(MongoDB::MongoClient->new('host' => 'mongodb://localhost,/example_db')->db_name, 'example_db', 'connection uri database trailing comma');
@@ -76,16 +90,20 @@ SKIP: {
     is(MongoDB::MongoClient->new('host' => 'mongodb://:@localhost/?')->db_name, 'admin', 'connection uri empty extras');
 }
 
-my $db = $conn->get_database('test_database');
-isa_ok($db, 'MongoDB::Database', 'get_database');
+# get_database and drop 
+{
+    my $db = $conn->get_database($testdb->name);
+    isa_ok($db, 'MongoDB::Database', 'get_database');
 
-$db->get_collection('test_collection')->insert({ foo => 42 }, {safe => 1});
+    $db->get_collection('test_collection')->insert({ foo => 42 }, {safe => 1});
 
-ok((grep { $_ eq 'test_database' } $conn->database_names), 'database_names');
+    ok((grep { /testdb/ } $conn->database_names), 'database_names');
 
-my $result = $db->drop;
-is(ref $result, 'HASH', $result);
-is($result->{'ok'}, 1, 'db was dropped');
+    my $result = $db->drop;
+    is(ref $result, 'HASH', $result);
+    is($result->{'ok'}, 1, 'db was dropped');
+}
+
 
 # TODO: won't work on master/slave until SERVER-2329 is fixed
 # ok(!(grep { $_ eq 'test_database' } $conn->database_names), 'database got dropped');
@@ -100,28 +118,62 @@ is($result->{'ok'}, 1, 'db was dropped');
     $conn->w("tag");
     is($conn->w, "tag", "set w to string");
 
-    dies_ok { $conn->w({tag => 1});} "Setting w to anything but a string or int dies.";
+    isnt(
+        exception { $conn->w({tag => 1});},
+        undef,
+        "Setting w to anything but a string or int dies."
+    );
 
     is($conn->wtimeout, 1000, "get wtimeout");
     $conn->wtimeout(100);
     is($conn->wtimeout, 100, "set wtimeout");
 
-    $db->drop;
+    $testdb->drop;
 }
+
+subtest "options" => sub {
+
+    subtest "connection" => sub {
+
+        my $ssl = "true";
+        my $timeout = 40000;
+        my $client = MongoDB::MongoClient->new({host => "mongodb://localhost/?ssl=$ssl&connectTimeoutMS=$timeout", auto_connect => 0});
+
+        is( $client->ssl, 1, "connect with ssl set" );
+        is( $client->timeout, $timeout, "connection timeout set" );
+    };
+
+    subtest "invalid option value" => sub {
+
+        like(
+            exception { MongoDB::MongoClient->new({host => "mongodb://localhost/?ssl=", auto_connect => 0}) },
+            qr/expected key value pair/,
+            'key should have value'
+        );
+    };
+
+    subtest "write concern" => sub {
+
+        my $w = 2;
+        my $wtimeout = 200;
+        my $j = "true";
+        my $client = MongoDB::MongoClient->new({host => "mongodb://localhost/?w=$w&wtimeoutMS=$wtimeout&journal=$j", auto_connect => 0});
+
+        is( $client->w, $w, "write acknowledgement set" );
+        is( $client->wtimeout, $wtimeout, "write acknowledgement timeout set" );
+        is( $client->j, 1, "sync to journal" );
+    };
+};
 
 
 # query_timeout
 {
-    my $timeout = $MongoDB::Cursor::timeout;
+    my $client = MongoDB::MongoClient->new(auto_connect => 0);
+    is($client->query_timeout, $MongoDB::Cursor::timeout, 'default query timeout');
 
-    my $conn2 = MongoDB::MongoClient->new(auto_connect => 0, ssl => $ENV{MONGO_SSL});
-    is($conn2->query_timeout, $timeout, 'query timeout');
-
-    $MongoDB::Cursor::timeout = 40;
-    $conn2 = MongoDB::MongoClient->new(auto_connect => 0, ssl => $ENV{MONGO_SSL});
-    is($conn2->query_timeout, 40, 'query timeout');
-
-    $MongoDB::Cursor::timeout = $timeout;
+    local $MongoDB::Cursor::timeout = 40;
+    $client = MongoDB::MongoClient->new(auto_connect => 0);
+    is($client->query_timeout, 40, 'changed default query timeout');
 }
 
 # max_bson_size
@@ -129,18 +181,26 @@ is($result->{'ok'}, 1, 'db was dropped');
     my $size = $conn->max_bson_size;
     my $result = $conn->get_database( 'admin' )->run_command({buildinfo => 1});
     if (exists $result->{'maxBsonObjectSize'}) {
-        is($size, $result->{'maxBsonObjectSize'});
+        is($size, $result->{'maxBsonObjectSize'}, 'max bson size');
     }
     else {
-        is($size, 4*1024*1024);
+        is($size, 4*1024*1024, 'max bson size');
     }
 }
 
-END {
-    if ($conn) {
-        $conn->get_database( 'foo' )->drop;
-    }
-    if ($db) {
-        $db->drop;
-    }
+# wire protocol versions
+
+{
+
+    is $conn->min_wire_version, 0, 'default min wire version';
+    is $conn->max_wire_version, 2, 'default max wire version';
+
+    like(
+        exception { MongoDBTest::build_client( min_wire_version => 99, max_wire_version => 100) },
+        qr/Incompatible wire protocol/i,
+        'exception on wire protocol'
+    );
+
 }
+
+done_testing;

@@ -19,10 +19,14 @@ package MongoDB::GridFS;
 
 # ABSTRACT: A file storage utility
 
-use Moose;
+use version;
+our $VERSION = 'v0.704.5.1';
+
 use MongoDB::GridFS::File;
-use DateTime;
+use DateTime 0.78; # drops dependency on bug-prone Math::Round
 use Digest::MD5;
+use Moose;
+use namespace::clean -except => 'meta';
 
 =head1 NAME
 
@@ -50,11 +54,11 @@ Core documentation on GridFS: L<http://dochub.mongodb.org/core/gridfs>.
 
 =head2 chunk_size
 
-The number of bytes per chunk.  Defaults to 1048576.
+The number of bytes per chunk.  Defaults to 261120 (255kb).
 
 =cut
 
-$MongoDB::GridFS::chunk_size = 1048576;
+$MongoDB::GridFS::chunk_size = 261120;
 
 has _database => (
     is       => 'ro',
@@ -118,11 +122,11 @@ sub _build_chunks {
 sub BUILD {
     my ($self) = @_;
    
-    # check for the required indexs in the system.indexes colleciton
+    # check for the required indexes in the system.indexes collection
     my $count = $self->_database->get_collection('system.indexes')->count({key=>{filename => 1}});
     $count   += $self->_database->get_collection('system.indexes')->count({key=>{files_id => 1, n => 1}});
     
-    # if we dont have the required indexes, create them now.
+    # if we don't have the required indexes, create them now.
     if ($count < 2){
        $self->_ensure_indexes();
     }
@@ -141,9 +145,12 @@ sub _ensure_indexes {
 
 =head2 get($id)
 
-    my $file = $grid->get("my file");
+    my $file = $grid->get($id);
 
 Get a file from GridFS based on its _id.  Returns a L<MongoDB::GridFS::File>.
+
+To retrieve a file based on metadata like C<filename>, use the L</find_one>
+method instead.
 
 =cut
 
@@ -160,6 +167,12 @@ sub get {
 Inserts a file into GridFS, adding a L<MongoDB::OID> as the _id field if the
 field is not already defined.  This is a wrapper for C<MongoDB::GridFS::insert>,
 see that method below for more information.
+
+To use a filename as the _id for subsequent C<get> calls, you must set _id
+explicitly:
+
+    $grid->put($fh, {_id => "pic.jpg", filename => "pic.jpg"});
+    my $file = $grid->get("pic.jpg");
 
 Returns the _id field.
 
@@ -310,13 +323,15 @@ sub insert {
     }
     $fh->setpos($start_pos);
 
-    # get an md5 hash for the file. set the retry flag to 'true' incase the 
-    # database, collection, or indexes are missing. That way we can recreate them 
-    # retry the md5 calc.
-    my $result = $self->_calc_md5($id, $self->prefix, 1);
-
+    my %copy = %{$metadata};
     # compare the md5 hashes
     if ($options->{safe}) {
+        # get an md5 hash for the file. set the retry flag to 'true' incase the 
+        # database, collection, or indexes are missing. That way we can recreate them 
+        # retry the md5 calc.
+        my $result = $self->_calc_md5($id, $self->prefix, 1);
+        $copy{"md5"} = $result->{"md5"};
+
         my $md5 = Digest::MD5->new;
         $md5->addfile($fh);
         my $digest = $md5->hexdigest;
@@ -327,9 +342,7 @@ sub insert {
         }
     }
 
-    my %copy = %{$metadata};
     $copy{"_id"} = $id;
-    $copy{"md5"} = $result->{"md5"};
     $copy{"chunkSize"} = $MongoDB::GridFS::chunk_size;
     $copy{"uploadDate"} = DateTime->now;
     $copy{"length"} = $length;
@@ -348,10 +361,10 @@ sub _calc_md5 {
     my $result = $self->_database->run_command(["filemd5", $id, "root" => $self->prefix]);
     
     # If we didn't get a hash back, it means something is wrong (probably to do with gridfs's 
-    # indexes because its currently the only error that is thown from the md5 class)
+    # indexes because its currently the only error that is thrown from the md5 class)
     if (ref($result) ne 'HASH') {
         # Yep, indexes are missing. If we have the $retry flag, lets create them calc the md5 again
-        # but we wont pass set the $retry flag again. we dont want an infinate loop for any reason. 
+        # but we wont pass set the $retry flag again. We don't want an infinite loop for any reason. 
         if ($retry == 1 && $result eq 'need an index on { files_id : 1 , n : 1 }'){
             $self->_ensure_indexes();
             $result = $self->_calc_md5($id, $root, 0);
@@ -380,6 +393,7 @@ sub drop {
 
     $self->files->drop;
     $self->chunks->drop;
+    $self->_ensure_indexes;
 }
 
 =head2 all
@@ -402,6 +416,8 @@ sub all {
     }
     return @ret;
 }
+
+__PACKAGE__->meta->make_immutable;
 
 1;
 

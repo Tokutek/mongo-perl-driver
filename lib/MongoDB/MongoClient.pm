@@ -18,17 +18,44 @@ package MongoDB::MongoClient;
 
 # ABSTRACT: A connection to a MongoDB server
 
+use version;
+our $VERSION = 'v0.704.5.1';
+
 use Moose;
-use Moose::Util::TypeConstraints;
 use MongoDB;
 use MongoDB::Cursor;
 use MongoDB::BSON::Binary;
+use MongoDB::BSON::Regexp;
+use MongoDB::Error;
 use Digest::MD5;
 use Tie::IxHash;
+use Time::HiRes qw/usleep/;
 use Carp 'carp', 'croak';
 use Scalar::Util 'reftype';
 use boolean;
 use Encode;
+use Try::Tiny;
+use MongoDB::_Types;
+use namespace::clean -except => 'meta';
+
+use constant {
+    PRIMARY             => 0, 
+    SECONDARY           => 1,
+    PRIMARY_PREFERRED   => 2,
+    SECONDARY_PREFERRED => 3,
+    NEAREST             => 4 
+};
+
+use constant _READPREF_MODENAMES => ['primary',
+                                     'secondary',
+                                     'primaryPreferred',
+                                     'secondaryPreferred',
+                                     'nearest'];
+
+use constant {
+    MIN_HEARTBEAT_FREQUENCY_MS => 10,
+    MAX_SCAN_TIME_SEC => 60,
+};
 
 has host => (
     is       => 'ro',
@@ -56,6 +83,39 @@ has j => (
 );
 
 
+has _readpref_mode => (
+    is      => 'rw',
+    isa     => 'Str',
+    default => MongoDB::MongoClient->PRIMARY
+);
+
+has _readpref_tagsets => (
+    is       => 'rw',
+    isa      => 'ArrayRef',
+    required => 0
+);
+
+has _readpref_pinned => (
+    is       => 'rw',
+    isa      => 'MongoDB::MongoClient',
+    required => 0
+);
+
+has _readpref_retries => (
+    is       => 'ro',
+    isa      => 'Int',
+    required => 1,
+    default  => 3
+);
+
+has _readpref_pingfreq_sec => (
+    is       => 'ro',
+    isa      => 'Int',
+    required => 1,
+    default  => 5 
+);
+
+
 has port => (
     is       => 'ro',
     isa      => 'Int',
@@ -79,7 +139,7 @@ has auto_connect => (
 );
 
 has timeout => (
-    is       => 'ro',
+    is       => 'rw',
     isa      => 'Int',
     required => 1,
     default  => 20000,
@@ -111,11 +171,28 @@ has query_timeout => (
     default  => sub { return $MongoDB::Cursor::timeout; },
 );
 
+# XXX this really shouldn't be required -- it should be populated lazily
+# on each connect (and probably private, too!)
 has max_bson_size => (
     is       => 'rw',
     isa      => 'Int',
     required => 1,
-    default  => 4194304
+    default  => 4194304,
+);
+
+has _max_bson_wire_size => (
+    is       => 'rw',
+    isa      => 'Int',
+    required => 1,
+    default  => 16_793_600, # 16MiB + 16KiB
+);
+
+# XXX eventually, get this off an isMaster call
+has _max_write_batch_size => (
+    is       => 'rw',
+    isa      => 'Int',
+    required => 1,
+    default  => 1000,
 );
 
 has find_master => (
@@ -125,9 +202,15 @@ has find_master => (
     default  => 0,
 );
 
+has _is_mongos => (
+    is       => 'rw',
+    isa      => 'Bool',
+    required => 1,
+    default  => 0
+);
 
 has ssl => (
-    is       => 'ro',
+    is       => 'rw',
     isa      => 'Bool',
     required => 1,
     default  => 0,
@@ -142,7 +225,7 @@ has sasl => (
 
 has sasl_mechanism => ( 
     is       => 'ro',
-    isa      => subtype( Str => where { /^GSSAPI|PLAIN$/ } ),
+    isa      => 'SASLMech',
     required => 1,
     default  => 'GSSAPI',
 );
@@ -160,6 +243,14 @@ has _master => (
     is       => 'rw',
 #    isa      => 'MongoDB::Connection',
     required => 0,
+);
+
+# cache our original constructor args in BUILD for creating
+# new, per-host connections
+has _opts => (
+    is      => 'rw',
+    isa     => 'HashRef',
+    default => sub { {} },
 );
 
 has ts => (
@@ -182,39 +273,74 @@ has inflate_dbrefs => (
     default   => 1
 );
 
+has inflate_regexps => ( 
+    is        => 'rw',
+    isa       => 'Bool',
+    required  => 0,
+    default   => 0,
+);
+
+# attributes for keeping track of client and server wire protocol versions
+has min_wire_version => ( 
+    is        => 'ro',
+    isa       => 'Int',
+    required  => 1,
+    default   => 0
+);
+
+has max_wire_version => (
+    is        => 'ro',
+    isa       => 'Int',
+    required  => 1,
+    default   => 2
+);
+
+has _use_write_cmd => ( 
+    is        => 'ro',
+    isa       => 'Bool',
+    required  => 1,
+    lazy_build => 1
+);
+
 sub BUILD {
     my ($self, $opts) = @_;
-    eval "use ${_}" # no Any::Moose::load_class becase the namespaces already have symbols from the xs bootstrap
+    eval "use ${_}" # no Any::Moose::load_class because the namespaces already have symbols from the xs bootstrap
         for qw/MongoDB::Database MongoDB::Cursor MongoDB::OID MongoDB::Timestamp/;
 
     my @pairs;
 
+    my %parsed_connection = _parse_connection_string($self->host);
+
     # supported syntax (see http://docs.mongodb.org/manual/reference/connection-string/)
-    if ($self->host =~ m{ ^
-            mongodb://
-            (?: ([^:]*) : ([^@]*) @ )? # [username:password@]
-            ([^/]*) # host1[:port1][,host2[:port2],...[,hostN[:portN]]]
-            (?:
-               / ([^?]*) # /[database]
-                (?: [?] (.*) )? # [?options]
-            )?
-            $ }x ) {
-        my ($username, $password, $hostpairs, $database, $options) = ($1, $2, $3, $4, $5);
+    if (%parsed_connection) {
+
+        @pairs = @{$parsed_connection{hostpairs}};
 
         # we add these things to $opts as well as self so that they get propagated when we recurse for multiple servers
-        $self->username($opts->{username} = $username) if $username;
-        $self->password($opts->{password} = $password) if $password;
-        $self->db_name($opts->{db_name} = $database) if $database;
+        for my $k ( qw/username password db_name/ ) {
+            $self->$k($opts->{$k} = $parsed_connection{$k}) if exists $parsed_connection{$k};
+        }
 
-        $hostpairs = 'localhost' unless $hostpairs;
-        @pairs =  map { $_ .= ':27017' unless $_ =~ /:/ ; $_ } split ',', $hostpairs;
+        # Process options
+        my %options = %{$parsed_connection{options}} if defined $parsed_connection{options};
 
-        # TODO handle standard options from $options
+        # Add connection options
+        $self->ssl($opts->{ssl} = _str_to_bool($options{ssl})) if exists $options{ssl};
+        $self->timeout($opts->{timeout} = $options{connectTimeoutMS}) if exists $options{connectTimeoutMS};
+
+        # Add write concern options
+        $self->w($opts->{w} = $options{w}) if exists $options{w};
+        $self->wtimeout($opts->{wtimeout} = $options{wtimeoutMS}) if exists $options{wtimeoutMS};
+        $self->j($opts->{j} = _str_to_bool($options{journal})) if exists $options{journal};
     }
     # deprecated syntax
     else {
         push @pairs, $self->host.":".$self->port;
     }
+
+    # We cache our updated constructor arguments because we need them again for
+    # creating new, per-host objects
+    $self->_opts( $opts );
 
     # a simple single server is special-cased (so we don't recurse forever)
     if (@pairs == 1 && !$self->find_master) {
@@ -223,31 +349,41 @@ sub BUILD {
         $self->_init_conn($hp[0], $hp[1], $self->ssl);
         if ($self->auto_connect) {
             $self->connect;
-            $self->max_bson_size($self->_get_max_bson_size);
         }
         return;
     }
 
     # multiple servers
+    my $first_server;
     my $connected = 0;
-    $opts->{find_master} = 0;
-    $opts->{auto_connect} = 0;
-    foreach (@pairs) {
-        $opts->{host} = "mongodb://$_";
+    my %errors;
+    for my $pair (@pairs) {
 
-        $self->_servers->{$_} = MongoDB::MongoClient->new($opts);
+        # override host, find_master and auto_connect
+        my $args = {
+            %$opts,
+            host => "mongodb://$pair",
+            find_master => 0,
+            auto_connect => 0,
+        };
+
+        $self->_servers->{$pair} = MongoDB::MongoClient->new($args);
+        $first_server = $self->_servers->{$pair} unless defined $first_server;
 
         next unless $self->auto_connect;
 
         # it's okay if we can't connect, so long as someone can
         eval {
-            $self->_servers->{$_}->connect;
-            $self->_servers->{$_}->max_bson_size($self->_servers->{$_}->_get_max_bson_size);
+            $self->_servers->{$pair}->connect;
         };
 
         # at least one connection worked
         if (!$@) {
             $connected = 1;
+        }
+        else {
+            $errors{$pair} = $@;
+            $errors{$pair} =~ s/at \S+ line \d+.*//;
         }
     }
 
@@ -257,24 +393,99 @@ sub BUILD {
 
         # if we still aren't connected to anyone, give up
         if (!$connected) {
-            die "couldn't connect to any servers listed: ".join(",", @pairs);
+            die "couldn't connect to any servers listed:\n" . join("", map { "$_: $errors{$_}" } keys %errors );
         }
 
-        $master = $self->get_master;
-        if ($master == -1) {
-            die "couldn't find master";
-        }
-        else {
-            $self->max_bson_size($master->max_bson_size);
-        }
+        $master = $self->get_master($first_server);
+        $self->max_bson_size($master->max_bson_size);
     }
     else {
         # no auto-connect so just pick one. if auto-reconnect is set then it will connect as needed
-        ($master) = values %{$self->_servers};
+        $master = $first_server;
     }
 
     # create a struct that just points to the master's connection
     $self->_init_conn_holder($master);
+}
+
+sub _str_to_bool {
+    my $str = shift;
+    confess "cannot convert undef to bool" unless defined $str;
+    my $ret = $str eq "true" ? 1 : $str eq "false" ? 0 : undef;
+    return $ret unless !defined $ret;
+    confess "expected boolean string 'true' or 'false' but instead received '$str'";
+}
+
+sub _unescape_all {
+    my $str = shift;
+    $str =~ s/%([0-9a-f]{2})/chr(hex($1))/ieg;
+    return $str;
+}
+
+sub _parse_connection_string {
+
+    my ($host) = @_;
+    my %result;
+
+    if ($host =~ m{ ^
+            mongodb://
+            (?: ([^:]*) : ([^@]*) @ )? # [username:password@]
+            ([^/]*) # host1[:port1][,host2[:port2],...[,hostN[:portN]]]
+            (?:
+               / ([^?]*) # /[database]
+                (?: [?] (.*) )? # [?options]
+            )?
+            $ }x ) {
+
+        ($result{username}, $result{password}, $result{hostpairs}, $result{db_name}, $result{options}) = ($1, $2, $3, $4, $5);
+
+        # Decode components
+        for my $subcomponent ( qw/username password db_name/ ) {
+            $result{$subcomponent} = _unescape_all($result{$subcomponent}) unless !(defined $result{$subcomponent});
+        }
+
+        $result{hostpairs} = 'localhost' unless $result{hostpairs};
+        $result{hostpairs} = [
+            map { @_ = split ':', $_; _unescape_all($_[0]).":"._unescape_all($_[1]) }
+            map { $_ .= ':27017' unless $_ =~ /:/ ; $_ } split ',', $result{hostpairs}
+        ];
+
+        $result{options} =
+            { map {
+                 my @kv = split '=', $_;
+                 confess 'expected key value pair' unless @kv == 2;
+                 ($kv[0], $kv[1]) = (_unescape_all($kv[0]), _unescape_all($kv[1]));
+                 @kv;
+              } split '&', $result{options}
+            } if defined $result{options};
+
+        delete $result{username} unless defined $result{username} && length $result{username};
+        delete $result{password} unless defined $result{password}; # can be empty string
+        delete $result{db_name} unless defined $result{db_name} && length $result{db_name};
+    }
+
+    return %result;
+}
+
+sub _update_server_attributes {
+    my ($self) = @_;
+    $self->max_bson_size($self->_get_max_bson_size);
+    $self->_check_wire_version;
+}
+
+sub _build__use_write_cmd { 
+    my $self = shift;
+
+    # find out if we support write commands
+    my $result = eval {
+        $self->get_database( $self->db_name )->_try_run_command( { "ismaster" => 1 } );
+    };
+
+    my $max_wire_version = ($result && exists $result->{maxWireVersion} )
+        ? $result->{maxWireVersion} : 0;
+
+    return 1 if $max_wire_version > 1;
+    return 0;
 }
 
 sub _get_max_bson_size {
@@ -290,13 +501,24 @@ sub _get_max_bson_size {
 
 sub database_names {
     my ($self) = @_;
-    my $ret = $self->get_database('admin')->run_command({ listDatabases => 1 });
-    if (ref($ret) eq 'HASH' && exists $ret->{databases}) {
-        return map { $_->{name} } @{ $ret->{databases} };
+
+    my @databases;
+    my $max_tries = 3;
+    for my $try ( 1 .. $max_tries ) {
+        last if try {
+            my $result = $self->get_database('admin')->_try_run_command({ listDatabases => 1 });
+            if (ref($result) eq 'HASH' && exists $result->{databases}) {
+                @databases = map { $_->{name} } @{ $result->{databases} };
+            }
+            return 1;
+        } catch {
+            # can't open db in a read lock
+            return if $_->{result}->{result}{code} == CANT_OPEN_DB_IN_READ_LOCK() || $try < $max_tries;
+            die $_;
+        };
     }
-    else {
-        die ($ret);
-    }
+
+    return @databases;
 }
 
 sub get_database {
@@ -321,84 +543,320 @@ sub _get_a_specific_connection {
     if (!$@) {
         return $self->_servers->{$host};
     }
-    return 0;
+    return;
 }
 
 sub _get_any_connection {
     my ($self) = @_;
 
+    if ( ! keys %{$self->_servers} ) {
+        return $self;
+    }
+
     while ((my $key, my $value) = each(%{$self->_servers})) {
         my $conn = $self->_get_a_specific_connection($key);
         if ($conn) {
+            # force a reset of the iterator 
+            my $reset = keys %{$self->_servers};
             return $conn;
         }
+    }
+
+    return;
+}
+
+sub get_master {
+    my ($self, $conn) = @_;
+
+    my $start = time;
+    while ( time - $start < MAX_SCAN_TIME_SEC ) {
+        $conn ||= $self->_get_any_connection()
+            or next;
+
+        # a single server or list of servers
+        if (!$self->find_master) {
+            $self->_master($conn);
+            return $self->_master;
+        }
+        # auto-detect master
+        else {
+            my $master = try {
+                $conn->get_database($self->db_name)->_try_run_command({"ismaster" => 1})
+            };
+
+            if ( !$master ) { 
+                undef $conn;
+                next;
+            };
+
+            # msg field from ismaster command will
+            # be set if in a sharded environment 
+            $self->_is_mongos(1) if $master->{'msg'};
+
+            # if this is a replica set & list of hosts is different, then update
+            if ($master->{'hosts'}
+                && join("", sort @{$master->{hosts}}) ne join("",sort keys %{$self->_servers})
+            ) {
+
+                # clear old host list before refreshing
+                %{$self->_servers} = ();
+
+                for (@{$master->{'hosts'}}) {
+                    # override host, find_master and auto_connect
+                    my $args = {
+                        %{ $self->_opts },
+                        host => "mongodb://$_",
+                        find_master => 0,
+                        auto_connect => 0,
+                    };
+
+                    $self->_servers->{$_} = $_ eq $master->{me} ? $conn : MongoDB::MongoClient->new($args);
+                }
+            }
+
+            # if this is the master, whether or not it's a replica set, return it
+            if ($master->{'ismaster'}) {
+                $self->_master($conn);
+                return $self->_master;
+            }
+            elsif ($self->find_master && exists $master->{'primary'}) {
+                my $primary = $self->_get_a_specific_connection($master->{'primary'})
+                    or next;
+
+                # double-check that this is master
+                my $result = try {
+                    $primary->get_database("admin")->_try_run_command({"ismaster" => 1})
+                };
+
+                if ( ! $result ) {
+                    $conn = $primary;
+                    next;
+                };
+
+                if ($result && $result->{'ismaster'}) {
+                    $self->_master($primary);
+                    return $self->_master;
+                }
+            }
+        }
+    }
+    continue {
+        usleep(MIN_HEARTBEAT_FREQUENCY_MS);
+    }
+
+    confess "couldn't find master";
+}
+
+
+sub read_preference {
+    my ($self, $mode, $tagsets) = @_;
+
+    croak "Missing read preference mode" if @_ < 2;
+    croak "Unrecognized read preference mode: $mode" if $mode < 0 || $mode > 4;
+    croak "NEAREST read preference mode not supported" if $mode == MongoDB::MongoClient->NEAREST; 
+    if (!$self->_is_mongos && (!$self->find_master || keys %{$self->_servers} < 2)) {
+        croak "Read preference must be used with a replica set; is find_master false?";
+    }
+    croak "PRIMARY cannot be combined with tags" if $mode == MongoDB::MongoClient->PRIMARY && $tagsets;
+
+    # only repin if mode or tagsets have changed
+    return if $mode == $self->_readpref_mode &&
+              defined $self->_readpref_tagsets &&
+              defined $tagsets &&
+              $tagsets == $self->_readpref_tagsets;
+
+    $self->_readpref_mode($mode);
+
+    $self->_readpref_tagsets($tagsets) if defined $tagsets;
+    $self->_readpref_tagsets([]) if !(defined $tagsets);
+
+    $self->repin();
+}
+
+sub _choose_secondary {
+    my ($self, $servers) = @_;
+
+    for (1 .. $self->_readpref_retries) {
+
+        my @secondaries = keys %{$servers};
+        return undef if @secondaries == 0;
+
+        my $secondary = $servers->{$secondaries[int(rand(scalar @secondaries))]};
+
+        if ($secondary->_check_ok(1)) {
+            return $secondary;
+        }
+        else {
+            delete $servers->{$secondary->host};
+        }
+    }
+
+    return undef;
+}
+
+
+sub _narrow_by_tagsets {
+    my ($self, $servers) = @_;
+
+    return unless @{$self->_readpref_tagsets};
+
+    my $conn = $self->_get_any_connection();
+    if (!$conn) {
+        # no connections available, clear the hash
+        undef %{$servers};
+        return;
+    }
+
+    my $replcoll = $conn->get_database('local')->get_collection('system.replset');
+    my $rsconf = $replcoll->find_one();
+
+    foreach my $conf (@{$rsconf->{'members'}}) {
+        next unless exists $conf->{'tags'};
+
+        my $member_matches = 0;
+
+        # see if any of the tagsets match the rs conf
+        TAGSET:
+        foreach my $tagset (@{$self->_readpref_tagsets}) {
+
+            foreach my $tagkey (keys %{$tagset}) {
+                next TAGSET unless exists $conf->{'tags'}->{$tagkey} &&
+                                   $tagset->{$tagkey} eq $conf->{'tags'}->{$tagkey};
+            }
+
+            $member_matches = 1;
+        }
+
+        # eliminate non-matching RS members
+        delete $servers->{'mongodb://' . $conf->{'host'}} unless $member_matches;
+    }
+}
+
+sub _check_ok {
+    my ($self, $retries) = @_;
+
+    foreach (1 .. $retries) {
+
+        my $status = try {
+            $self->get_database('admin')->_try_run_command({ping => 1});
+        };
+
+        return 1 if $status;
     }
 
     return 0;
 }
 
-
-sub get_master {
+sub repin {
     my ($self) = @_;
 
-    my $conn = $self->_get_any_connection();
-    # if we couldn't connect to anything, just return
-    if (!$conn) {
-        return -1;
+    if ($self->_is_mongos) {
+        $self->_readpref_pinned($self);
+        return;
     }
 
-    # a single server or list of servers
-    if (!$self->find_master) {
-        $self->_master($conn);
-        return $self->_master;
+    $self->get_master if !$self->_master;
+
+    my %secondaries = %{$self->_servers};
+    foreach (keys %secondaries) {
+        my $value = $secondaries{$_};
+        $value->{'query_timeout'} = $self->query_timeout;
+        delete $secondaries{$_};
+        $secondaries{"mongodb://$_"} = $value;
     }
-    # auto-detect master
-    else {
-        my $master = $conn->get_database($self->db_name)->run_command({"ismaster" => 1});
+    my $primary = $secondaries{$self->_master->host};
+    confess "internal error in host list" unless $primary;
+    delete $secondaries{$primary->host};
 
-        # check for errors
-        if (ref($master) eq 'SCALAR') {
-            return -1;
+    my $mode = $self->_readpref_mode;
+
+    # pin the primary or die
+    if ($mode == MongoDB::MongoClient->PRIMARY) {
+        if ($primary->_check_ok($self->_readpref_retries)) {
+            $self->_readpref_pinned($primary);
+            return;
         }
-
-        # if this is a replica set & we haven't renewed the host list in 1 sec
-        if ($master->{'hosts'} && time() > $self->ts) {
-            # update (or set) rs list
-            my %opts = ( auto_connect => 0 );
-            if ($self->username && $self->password) {
-                $opts{username} = $self->username;
-                $opts{password} = $self->password;
-                $opts{db_name}  = $self->db_name;
-            }
-            for (@{$master->{'hosts'}}) {
-                if (!$self->_servers->{$_}) {
-                    $self->_servers->{$_} = MongoDB::MongoClient->new("host" => "mongodb://$_", %opts);
-                }
-            }
-            $self->ts(time());
-        }
-
-        # if this is the master, whether or not it's a replica set, return it
-        if ($master->{'ismaster'}) {
-            $self->_master($conn);
-            return $self->_master;
-        }
-        elsif ($self->find_master && exists $master->{'primary'}) {
-            my $primary = $self->_get_a_specific_connection($master->{'primary'});
-            if (!$primary) {
-                return -1;
-            }
-
-            # double-check that this is master
-            my $result = $primary->get_database("admin")->run_command({"ismaster" => 1});
-            if ($result->{'ismaster'}) {
-                $self->_master($primary);
-                return $self->_master;
-            }
+        else {
+            die "No replica set primary available for query with read_preference PRIMARY";
         }
     }
 
-    return -1;
+    # pin an arbitrary secondary or die
+    elsif ($mode == MongoDB::MongoClient->SECONDARY) {
+        $self->_narrow_by_tagsets(\%secondaries);
+        my $secondary = $self->_choose_secondary(\%secondaries);
+        if ($secondary) {
+            $self->_readpref_pinned($secondary);
+            return;
+        }
+        else {
+            die "No replica set secondary available for query with read_preference SECONDARY";
+        }
+    }
+
+    # if no primary available, then pin an arbitrary secondary
+    elsif ($mode == MongoDB::MongoClient->PRIMARY_PREFERRED) {
+        if ($primary->_check_ok($self->_readpref_retries)) {
+            $self->_readpref_pinned($primary);
+            return;
+        }
+        else {
+            $self->_narrow_by_tagsets(\%secondaries);
+            my $secondary = $self->_choose_secondary(\%secondaries);
+            if ($secondary) {
+                $self->_readpref_pinned($secondary);
+                return;
+            }
+        }
+    }
+
+    # if no secondary available, then pin the primary
+    elsif ($mode == MongoDB::MongoClient->SECONDARY_PREFERRED) {
+        $self->_narrow_by_tagsets(\%secondaries);
+        my $secondary = $self->_choose_secondary(\%secondaries);
+        if ($secondary) {
+            $self->_readpref_pinned($secondary);
+            return;
+        }
+        elsif ($primary->_check_ok($self->_readpref_retries)) {
+            $self->_readpref_pinned($primary);
+            return;
+        }
+    }
+
+    die "No replica set members available for query";
+}
+
+
+sub rs_refresh {
+    my ($self) = @_;
+
+    # only refresh if connected directly
+    # to a replica set
+    return unless $self->find_master;
+    return unless $self->_readpref_pinned;
+    return if $self->_is_mongos;
+
+    # ping rs members, and repin if something has changed
+    my $repin_required = 0;
+    my $any_conn;
+    if (time() > ($self->ts + $self->_readpref_pingfreq_sec)) {
+        for (keys %{$self->_servers}) {
+            my $server = $self->_servers->{$_};
+            my $connected = $server->connected;
+            my $ok = $server->_check_ok(1);
+            if (($ok && !$connected) || (!$ok && $connected)) {
+                $repin_required = 1;
+            }
+            if ($ok && !$any_conn) {
+                $any_conn = $server;
+            }
+        }
+        $self->get_master($any_conn) if $any_conn;
+    }
+   
+    $self->repin if $repin_required;
+    $self->ts(time());
 }
 
 
@@ -413,9 +871,9 @@ sub authenticate {
 
     # get the nonce
     my $db = $self->get_database($dbname);
-    my $result = $db->run_command({getnonce => 1});
-    if (!$result->{'ok'}) {
-        return $result;
+    my $result = eval { $db->_try_run_command({getnonce => 1}) };
+    if (!$result) {
+        return $@
     }
 
     my $nonce = $result->{'nonce'};
@@ -515,6 +973,32 @@ sub _sasl_plain_authenticate {
     $self->_sasl_start( $payload, "PLAIN" );    
 } 
 
+
+sub _check_wire_version { 
+    my ( $self ) = @_;
+    # check our wire protocol version compatibility
+    
+    my $master = $self->get_database( $self->db_name )->_try_run_command( { ismaster => 1 } );
+    $master->{minWireVersion} ||= 0;
+    $master->{maxWireVersion} ||= 0;
+
+    if (    ( $master->{minWireVersion} > $self->max_wire_version )
+            or ( $master->{maxWireVersion} < $self->min_wire_version ) ) { 
+        die "Incompatible wire protocol version. This version of the MongoDB driver is not compatible with the server. You probably need to upgrade this library.";
+    }
+
+}
+
+sub _write_concern {
+    my ($self) = @_;
+    my $wc = {
+        w => $self->w,
+        wtimeout => $self->wtimeout,
+    };
+    $wc->{j} = $self->j if $self->j;
+    return $wc;
+}
+
 __PACKAGE__->meta->make_immutable( inline_destructor => 0 );
 
 1;
@@ -527,10 +1011,22 @@ __END__
 
 =head1 SYNOPSIS
 
-The MongoDB::MongoClient class creates a client connection to the MongoDB server.
+    use strict;
+    use warnings;
+    use MongoDB;
+
+    # connects to localhost:27017
+    my $client = MongoDB::MongoClient->new;
+
+    my $db = $client->get_database("test");
+
+=head1 DESCRIPTION
+
+The C<MongoDB::MongoClient> class creates a client connection to one or
+more MongoDB servers.
 
 By default, it connects to a single server running on the local machine
-listening on the default port:
+listening on the default port 27017:
 
     # connects to localhost:27017
     my $client = MongoDB::MongoClient->new;
@@ -541,14 +1037,28 @@ It can connect to a database server running anywhere, though:
 
 See the L</"host"> section for more options for connecting to MongoDB.
 
+MongoDB can be started in I<authentication mode>, which requires clients to log in
+before manipulating data.  By default, MongoDB does not start in this mode, so no
+username or password is required to make a fully functional connection.  If you
+would like to learn more about authentication, see the C<authenticate> method.
+
+Connecting is relatively expensive, so try not to open superfluous connections.
+
+There is no way to explicitly disconnect from the database.  However, the
+connection will automatically be closed and cleaned up when no references to
+the C<MongoDB::MongoClient> object exist, which occurs when C<$client> goes out of
+scope (or earlier if you undefine it with C<undef>).
+
 =head1 MULTITHREADING
 
-Cloning instances of this class is disabled in Perl 5.8.7+, so forked threads
-will have to create their own connections to the database.
+Existing connections are closed when a thread is created.  If C<auto_reconnect>
+is true, then connections will be re-established as needed.
 
 =head1 SEE ALSO
 
 Core documentation on connections: L<http://docs.mongodb.org/manual/reference/connection-string/>.
+
+The currently supported connection string options are ssl, connectTimeoutMS, w, wtimeoutMS, and journal.
 
 =attr host
 
@@ -609,7 +1119,7 @@ number for more replicas.
 In MongoDB v2.0+, you can "tag" replica members. With "tagging" you can specify a 
 new "getLastErrorMode" where you can create new
 rules on how your data is replicated. To used you getLastErrorMode, you pass in the 
-name of the mode to the C<w> parameter. For more infomation see: 
+name of the mode to the C<w> parameter. For more information see: 
 http://www.mongodb.org/display/DOCS/Data+Center+Awareness
 
 =attr wtimeout
@@ -623,9 +1133,10 @@ See C<w> above for more information.
 
 =attr j
 
-If true, awaits the journal commit before returning. If the server is running without 
-journaling, it returns immediately, and successfully.
-
+If true, the client will block until write operations have been committed to the
+server's journal. Prior to MongoDB 2.6, this option was ignored if the server was 
+running without journaling. Starting with MongoDB 2.6, write operations will fail 
+if this option is used when the server is running without journaling.
 
 =attr auto_reconnect
 
@@ -795,6 +1306,10 @@ Controls whether L<DBRef|http://docs.mongodb.org/manual/applications/database-re
 are automatically inflated into L<MongoDB::DBRef> objects. Defaults to true.
 Set this to C<0> if you don't want to auto-inflate them.
 
+=attr inflate_regexps
+
+Controls whether regular expressions stored in MongoDB are inflated into L<MongoDB::BSON::Regexp> objects instead of native Perl Regexps. The default is false. This can be dangerous, since the JavaScript regexps used internally by MongoDB are of a different dialect than Perl's. The default for this attribute may become true in future versions of the driver. 
+
 =method connect
 
     $client->connect;
@@ -813,15 +1328,6 @@ Lists all databases on the MongoDB server.
     my $database = $client->get_database('foo');
 
 Returns a L<MongoDB::Database> instance for the database with the given C<$name>.
-
-=method get_master
-
-    $master = $client->get_master
-
-Determines which host of a paired connection is master.  Does nothing for
-a non-paired connection.  This need never be invoked by a user, it is
-called automatically by internal functions.  Returns the index of the master
-connection in the list of connections or -1 if it cannot be determined.
 
 =method authenticate ($dbname, $username, $password, $is_digest?)
 
@@ -845,15 +1351,12 @@ Low-level function to send a string directly to the database.  Use
 L<MongoDB::write_insert>, L<MongoDB::write_update>, L<MongoDB::write_remove>, or
 L<MongoDB::write_query> to create a valid string.
 
-=method recv(\%info)
+=method recv($cursor)
 
-    my $cursor = $client->recv({ns => "foo.bar"});
+    my $ok = $client->recv($cursor);
 
-Low-level function to receive a response from the database. Returns a
-C<MongoDB::Cursor>.  At the moment, the only required field for C<$info> is
-"ns", although "request_id" is likely to be required in the future.  The
-C<$info> hash will be automatically created for you by L<MongoDB::write_query>.
-
+Low-level function to receive a response from the database into a cursor.
+Dies on error.  Returns true if any results were received and false otherwise.
 
 =method fsync(\%args)
 
@@ -874,3 +1377,37 @@ The primary use of fsync is to lock the database during backup operations. This 
     $conn->fsync_unlock();
 
 Unlocks a database server to allow writes and reverses the operation of a $conn->fsync({lock => 1}); operation. 
+
+=method read_preference
+
+    $conn->read_preference(MongoDB::MongoClient->PRIMARY_PREFERRED, [{'disk' => 'ssd'}, {'rack' => 'k'}]);
+
+Sets the read preference for this connection. The first argument is the read
+preference mode and should be one of four constants: PRIMARY, SECONDARY,
+PRIMARY_PREFERRED, or SECONDARY_PREFERRED (NEAREST is not yet supported).
+In order to use read preference, L<MongoDB::MongoClient/find_master> must be set.
+The second argument (optional) is an array reference containing tagsets. The tagsets can
+be used to match the tags for replica set secondaries. See also
+L<MongoDB::Cursor/read_preference>. For core documentation on read preference
+see L<http://docs.mongodb.org/manual/core/read-preference/>.
+
+=method repin
+
+    $conn->repin()
+
+Chooses a replica set member to which this connection should route read operations,
+according to the read preference that has been set via L<MongoDB::MongoClient/read_preference>
+or L<MongoDB::Cursor/read_preference>. This method is called automatically
+when the read preference or replica set state changes, and generally does not
+need to be called by application code. 
+
+=method rs_refresh
+
+    $conn->rs_refresh()
+
+If it has been at least 5 seconds since last checking replica set state,
+then ping all replica set members. Calls L<MongoDB::MongoClient/repin> if
+a previously reachable node is now unreachable, or a previously unreachable
+node is now reachable. This method is called automatically before communicating
+with the server, and therefore should not generally be called by client code.
+

@@ -16,8 +16,7 @@
 
 use strict;
 use warnings;
-use Test::More;
-use Test::Exception;
+use Test::More 0.96;
 
 use MongoDB;
 use MongoDB::OID;
@@ -27,14 +26,12 @@ use DateTime;
 use JSON;
 
 use lib "t/lib";
-use MongoDBTest '$conn';
+use MongoDBTest qw/build_client get_test_db/;
 
-plan tests => 61;
+my $conn = build_client();
+my $testdb = get_test_db($conn);
 
-
-my $db = $conn->get_database('x');
-my $coll = $db->get_collection('y');
-
+my $coll = $testdb->get_collection('y');
 $coll->drop;
 
 my $id = MongoDB::OID->new;
@@ -55,7 +52,7 @@ is($id."", $id->value);
     my $now = DateTime->now;
     $id = MongoDB::OID->new;
     
-    is($now->epoch, $id->get_time);
+    ok($id->get_time >= $now->epoch, "OID time >= epoch" );
 }
 
 # creating ids from an existing value
@@ -76,63 +73,67 @@ is($id."", $id->value);
 }
 
 #regexes
+{
+    $coll->insert({'x' => 'FRED', 'y' => 1});
+    $coll->insert({'x' => 'bob'});
+    $coll->insert({'x' => 'fRed', 'y' => 2});
 
-$coll->insert({'x' => 'FRED', 'y' => 1});
-$coll->insert({'x' => 'bob'});
-$coll->insert({'x' => 'fRed', 'y' => 2});
+    my $freds = $coll->query({'x' => qr/fred/i})->sort({'y' => 1});
 
-my $freds = $coll->query({'x' => qr/fred/i})->sort({'y' => 1});
+    is($freds->next->{'x'}, 'FRED', 'case insensitive');
+    is($freds->next->{'x'}, 'fRed', 'case insensitive');
+    ok(!$freds->has_next, 'bob doesn\'t match');
 
-is($freds->next->{'x'}, 'FRED', 'case insensitive');
-is($freds->next->{'x'}, 'fRed', 'case insensitive');
-ok(!$freds->has_next, 'bob doesn\'t match');
+    my $fred = $coll->find_one({'x' => qr/^F/});
+    is($fred->{'x'}, 'FRED', 'starts with');
 
-my $fred = $coll->find_one({'x' => qr/^F/});
-is($fred->{'x'}, 'FRED', 'starts with');
+    # saving/getting regexes
+    $coll->drop;
+    $coll->insert({"r" => qr/foo/i});
+    my $obj = $coll->find_one;
+    ok("foo" =~ $obj->{'r'}, 'matches');
 
-# saving/getting regexes
-$coll->drop;
-$coll->insert({"r" => qr/foo/i});
-my $obj = $coll->find_one;
-ok("foo" =~ $obj->{'r'}, 'matches');
+    SKIP: {
+        skip "regex flags don't work yet with perl 5.8", 1 if $] =~ /5\.008/;
+        ok("FOO" =~ $obj->{'r'}, 'this won\'t pass with Perl 5.8');
+    }
 
-SKIP: {
-    skip "regex flags don't work yet with perl 5.8", 1 if $] =~ /5\.008/;
-    ok("FOO" =~ $obj->{'r'}, 'this won\'t pass with Perl 5.8');
+    ok(!("bar" =~ $obj->{'r'}), 'not a match');
 }
 
-ok(!("bar" =~ $obj->{'r'}), 'not a match');
-
-
 # date
-$coll->drop;
+{
+    $coll->drop;
 
-my $now = DateTime->now;
+    my $now = DateTime->now;
 
-$coll->insert({'date' => $now});
-my $date = $coll->find_one;
+    $coll->insert({'date' => $now});
+    my $date = $coll->find_one;
 
-is($date->{'date'}->epoch, $now->epoch);
-is($date->{'date'}->day_of_week, $now->day_of_week);
+    is($date->{'date'}->epoch, $now->epoch);
+    is($date->{'date'}->day_of_week, $now->day_of_week);
 
-my $past = DateTime->from_epoch('epoch' => 1234567890);
+    my $past = DateTime->from_epoch('epoch' => 1234567890);
 
-$coll->insert({'date' => $past});
-$date = $coll->find_one({'date' => $past});
+    $coll->insert({'date' => $past});
+    $date = $coll->find_one({'date' => $past});
 
-is($date->{'date'}->epoch, 1234567890);
+    is($date->{'date'}->epoch, 1234567890);
+}
 
 # minkey/maxkey
-$coll->drop;
+{
+    $coll->drop;
 
-my $min = bless {}, "MongoDB::MinKey";
-my $max = bless {}, "MongoDB::MaxKey";
+    my $min = bless {}, "MongoDB::MinKey";
+    my $max = bless {}, "MongoDB::MaxKey";
 
-$coll->insert({min => $min, max => $max});
-my $x = $coll->find_one;
+    $coll->insert({min => $min, max => $max});
+    my $x = $coll->find_one;
 
-isa_ok($x->{min}, 'MongoDB::MinKey');
-isa_ok($x->{max}, 'MongoDB::MaxKey');
+    isa_ok($x->{min}, 'MongoDB::MinKey');
+    isa_ok($x->{max}, 'MongoDB::MaxKey');
+}
 
 # tie::ixhash
 {
@@ -143,11 +144,11 @@ isa_ok($x->{max}, 'MongoDB::MaxKey');
     $test{one} = "on"; 
     $test{two} = 2; 
     
-    $coll->insert(\%test);
+    ok( $coll->insert(\%test), "inserted IxHash") ;
 
     my $doc = $coll->find_one;
-    is($doc->{'one'}, 'on');
-    is($doc->{'two'}, 2);
+    is($doc->{'one'}, 'on', "field one");
+    is($doc->{'two'}, 2, "field two");
 }
 
 # binary
@@ -155,10 +156,10 @@ isa_ok($x->{max}, 'MongoDB::MaxKey');
     $coll->remove;
 
     my $invalid = "\xFE";
-    $coll->insert({"bin" => \$invalid});
+    ok( $coll->insert({"bin" => \$invalid}), "inserted binary data" );
 
     my $one = $coll->find_one;
-    is($one->{'bin'}, "\xFE");
+    is($one->{'bin'}, "\xFE", "read binary data");
 }
 
 # 64-bit ints
@@ -170,7 +171,8 @@ isa_ok($x->{max}, 'MongoDB::MaxKey');
     $coll->save({x => $x});
     my $result = $coll->find_one;
 
-    is($result->{'x'}, 17179869184);
+    is($result->{'x'}, 17179869184)
+        or diag explain $result;
 
     $coll->remove;
 
@@ -178,13 +180,15 @@ isa_ok($x->{max}, 'MongoDB::MaxKey');
     $coll->save({x => $x});
     $result = $coll->find_one;
 
-    is($result->{'x'}, -17179869184);
+    is($result->{'x'}, -17179869184)
+        or diag explain $result;
 
     $coll->remove;
 
     $coll->save({x => 2712631400});
     $result = $coll->find_one;
-    is($result->{'x'}, 2712631400);
+    is($result->{'x'}, 2712631400)
+        or diag explain $result;
 
     eval {
         my $ok = $coll->save({x => 9834590149023841902384137418571984503});
@@ -209,14 +213,20 @@ isa_ok($x->{max}, 'MongoDB::MaxKey');
     is(keys %$scope, 0);
     is($ret_code->code, $str);
 
-    my $x = $db->eval($code);
-    is($x, 5);
+    my $x;
+
+    if ( ! $conn->password ) {
+        $x = $testdb->eval($code);
+        is($x, 5);
+    }
 
     $str = "function() { return name; }";
     $code = MongoDB::Code->new("code" => $str,
                                "scope" => {"name" => "Fred"});
-    $x = $db->eval($code);
-    is($x, "Fred");
+    if ( ! $conn->password ) {
+        $x = $testdb->eval($code);
+        is($x, "Fred");
+    }
 
     $coll->remove;
 
@@ -305,8 +315,8 @@ SKIP: {
 
     my $x = 1.0;
     my ($double_type, $int_type) = ({x => {'$type' => 1}},
-				    {'$or' => [{x => {'$type' => 16}},
-					       {x => {'$type' => 18}}]});
+                                    {'$or' => [{x => {'$type' => 16}},
+                                               {x => {'$type' => 18}}]});
 
     MongoDB::force_double($x);
     $coll->insert({x => $x});
@@ -324,8 +334,4 @@ SKIP: {
     is($result->{x}, 1);
 }
 
-END {
-    if ($db) {
-        $db->drop;
-    }
-}
+done_testing;

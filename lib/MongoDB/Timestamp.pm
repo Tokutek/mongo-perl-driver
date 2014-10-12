@@ -19,6 +19,9 @@ package MongoDB::Timestamp;
 
 # ABSTRACT: Replication timestamp
 
+use version;
+our $VERSION = 'v0.704.5.1';
+
 =head1 NAME
 
 MongoDB::Timestamp - Timestamp used for replication
@@ -33,6 +36,7 @@ L<DateTime>.  See <MongoDB::DataTypes> for more information.
 =cut
 
 use Moose;
+use namespace::clean -except => 'meta';
 
 =head1 ATTRIBUTES
 
@@ -59,5 +63,7 @@ has inc => (
     isa      => 'Int',
     required => 1,
 );
+
+__PACKAGE__->meta->make_immutable;
 
 1;

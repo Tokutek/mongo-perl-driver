@@ -18,8 +18,10 @@ package MongoDB::Connection;
 
 # ABSTRACT: A connection to a MongoDB server (DEPRECATED)
 
-use Moose;
+use version;
+our $VERSION = 'v0.704.5.1';
 
+use Moose;
 use MongoDB;
 use MongoDB::Cursor;
 use MongoDB::MongoClient;
@@ -29,7 +31,7 @@ use Digest::MD5;
 use Tie::IxHash;
 use Carp 'carp';
 use boolean;
-
+use namespace::clean -except => 'meta';
 
 has '_client' => (
     isa         => 'MongoDB::MongoClient', 
@@ -44,22 +46,6 @@ around 'new' => sub {
     my ( $orig, $self, @args ) = @_;
     return $self->$orig( _client => MongoDB::MongoClient->new( @args ) );
 };
-
-
-
-sub AUTOLOAD {
-    my $self = shift @_;
-    our $AUTOLOAD;
-
-    my $db = $AUTOLOAD;
-    $db =~ s/.*:://;
-
-    carp sprintf q{AUTOLOADed database method names are deprecated and will be removed in a future release. Use $client->get_database( '%s' ) instead.}, $db;
-
-    return $self->get_database($db);
-}
-
-
 
 __PACKAGE__->meta->make_immutable ( inline_destructor => 0, inline_constructor => 0 );
 
@@ -93,11 +79,6 @@ It can connect to a database server running anywhere, though:
     my $connection = MongoDB::Connection->new(host => 'example.com:12345');
 
 See the L</"host"> section for more options for connecting to MongoDB.
-
-=head2 MULTITHREADING
-
-Cloning instances of this class is disabled in Perl 5.8.7+, so forked threads
-will have to create their own connections to the database.
 
 =head1 SEE ALSO
 
@@ -176,10 +157,10 @@ safe insert times out and croaks.
 I<MongoDB server version 2.0+: "majority" and Data Center Awareness>
 
 As of MongoDB 2.0+, the 'w' parameter can be passed strings. This can be done by passing it the string "majority" this will wait till the B<majority> of 
-of the nodes in the replica set have recieved the data. For more information see: http://www.mongodb.org/display/DOCS/getLastError+Command#getLastErrorCommand-majority
+of the nodes in the replica set have received the data. For more information see: http://www.mongodb.org/display/DOCS/getLastError+Command#getLastErrorCommand-majority
 
 This can be useful for "Data Center Awareness." In v2.0+, you can "tag" replica members. With "tagging" you can specify a new "getLastErrorMode" where you can create new
-rules on how your data is replicated. To used you getLastErrorMode, you pass in the name of the mode to the 'w' parameter. For more infomation see: http://www.mongodb.org/display/DOCS/Data+Center+Awareness
+rules on how your data is replicated. To used you getLastErrorMode, you pass in the name of the mode to the 'w' parameter. For more information see: http://www.mongodb.org/display/DOCS/Data+Center+Awareness
 
 =head2 wtimeout
 
@@ -345,7 +326,7 @@ automatically hashed before sending over the wire, unless C<$is_digest> is
 true, which will assume you already did the hashing on yourself.
 
 See also the core documentation on authentication:
-L<http://dochub.mongodb.org/core/authentication>.
+L<http://docs.mongodb.org/manual/core/access-control/>.
 
 
 =head2 send($str)

@@ -18,9 +18,17 @@ package MongoDB::Cursor;
 
 
 # ABSTRACT: A cursor/iterator for Mongo query results
+
+use version;
+our $VERSION = 'v0.704.5.1';
+
 use Moose;
+use MongoDB;
+use MongoDB::Error;
 use boolean;
 use Tie::IxHash;
+use Try::Tiny;
+use namespace::clean -except => 'meta';
 
 =head1 NAME
 
@@ -36,8 +44,9 @@ MongoDB::Cursor - A cursor/iterator for Mongo query results
 
 =head2 Multithreading
 
-Cloning instances of this class is disabled in Perl 5.8.7+, so forked threads
-will have to create their own database queries.
+Cursors are cloned in threads, but not reset.  Iterating the same cursor from
+multiple threads will give unpredictable results.  Only iterate from a single
+thread.
 
 =head1 SEE ALSO
 
@@ -79,7 +88,7 @@ $MongoDB::Cursor::timeout = 30000;
 =head2 started_iterating
 
 If this cursor has queried the database yet. Methods
-mofifying the query will complain if they are called
+modifying the query will complain if they are called
 after the database is queried.
 
 =cut
@@ -91,8 +100,14 @@ has started_iterating => (
     default => 0,
 );
 
-has _client => (
+has _master => (
     is => 'ro',
+    isa => 'MongoDB::MongoClient',
+    required => 1,
+);
+
+has _client => (
+    is => 'rw',
     isa => 'MongoDB::MongoClient',
     required => 1,
 );
@@ -105,6 +120,7 @@ has _ns => (
 
 has _query => (
     is => 'rw',
+    isa => 'Tie::IxHash',
     required => 1,
 );
 
@@ -114,6 +130,15 @@ has _fields => (
 );
 
 has _limit => (
+    is => 'rw',
+    isa => 'Int',
+    required => 0,
+    default => 0,
+);
+
+# XXX this is here for testing; we can rationalize this later
+# with _aggregate_batch_size when we convert to pure Perl
+has _batch_size => (
     is => 'rw',
     isa => 'Int',
     required => 0,
@@ -133,7 +158,6 @@ has _tailable => (
     required => 0,
     default => 0,
 );
-
 
 
 
@@ -160,12 +184,14 @@ See L<MongoDB::Connection/query_timeout>.
 =cut
 
 
+
 has immortal => (
     is => 'rw',
     isa => 'Bool',
     required => 0,
     default => 0,
 );
+
 
 
 =head2 partial
@@ -176,6 +202,7 @@ shard.  If this is set, mongos will just skip that shard, instead.
 Boolean value, defaults to 0.
 
 =cut
+
 
 has partial => (
     is => 'rw',
@@ -201,17 +228,31 @@ has slave_okay => (
     default => 0,
 );
 
-
-# stupid hack for inconsistent database handling of queries
-has _grrrr => (
-    is      => 'rw',
-    isa     => 'Bool',
-    default => 0,
-);
-
 has _request_id => (
     is      => 'rw',
     isa     => 'Int',
+    default => 0,
+);
+
+
+# special attributes for aggregation cursors
+has _agg_first_batch => (
+    is      => 'ro',
+    isa     => 'Maybe[ArrayRef]',
+);
+
+has _agg_batch_size => ( 
+    is      => 'rw',
+    isa     => 'Int',
+    default => 0,
+);
+
+# special flag for parallel scan cursors, since they
+# start out empty
+
+has _is_parallel => (
+    is      => 'ro',
+    isa     => 'Bool',
     default => 0,
 );
 
@@ -219,20 +260,23 @@ has _request_id => (
 
 =cut
 
-sub _ensure_special {
+
+sub _ensure_nested {
     my ($self) = @_;
-
-    if ($self->_grrrr) {
-        return;
+    if ( ! $self->_query->EXISTS('$query') ) {
+        $self->_query( Tie::IxHash->new('$query' => $self->_query) );
     }
-
-    $self->_grrrr(1);
-    $self->_query({'query' => $self->_query})
+    return;
 }
 
 # this does the query if it hasn't been done yet
 sub _do_query {
     my ($self) = @_;
+
+    $self->_master->rs_refresh();
+
+    # in case the refresh caused a repin
+    $self->_client(MongoDB::Collection::_select_cursor_client($self->_master, $self->_ns, $self->_query));
 
     if ($self->started_iterating) {
         return;
@@ -243,11 +287,31 @@ sub _do_query {
         ($self->immortal << 4) |
         ($self->partial << 7);
 
-    my ($query, $info) = MongoDB::write_query($self->_ns, $opts, $self->_skip, $self->_limit, $self->_query, $self->_fields);
+    my ($query, $info) = MongoDB::write_query($self->_ns, $opts, $self->_skip, $self->_limit || $self->_batch_size, $self->_query, $self->_fields);
     $self->_request_id($info->{'request_id'});
 
-    $self->_client->send($query);
-    $self->_client->recv($self);
+    if ( length($query) > $self->_client->_max_bson_wire_size ) {
+        MongoDB::_CommandSizeError->throw(
+            message => "database command too large",
+            size => length $query,
+        );
+    }
+
+    eval {
+        $self->_client->send($query);
+        $self->_client->recv($self); 
+    };
+    if ($@ && $self->_master->_readpref_pinned) {
+        $self->_master->repin();
+        $self->_client($self->_master->_readpref_pinned);
+        $self->_client->send($query); 
+        $self->_client->recv($self); 
+    }
+    elsif ($@) {
+        # rethrow the exception if read preference
+        # has not been set
+        die $@;
+    }
 
     $self->started_iterating(1);
 }
@@ -295,8 +359,8 @@ sub sort {
     confess 'not a hash reference'
 	    unless ref $order eq 'HASH' || ref $order eq 'Tie::IxHash';
 
-    $self->_ensure_special;
-    $self->_query->{'orderby'} = $order;
+    $self->_ensure_nested;
+    $self->_query->STORE('orderby', $order);
     return $self;
 }
 
@@ -320,6 +384,29 @@ sub limit {
     return $self;
 }
 
+
+=head2 max_time_ms( $millis )
+
+    $cursor = $coll->query->max_time_ms( 500 );
+
+Causes the server to abort the operation if the specified time in 
+milliseconds is exceeded. 
+
+=cut
+
+sub max_time_ms { 
+    my ( $self, $num ) = @_;
+    $num = 0 unless defined $num;
+    confess "max_time_ms must be non-negative"
+      if $num < 0;
+    confess "can not set max_time_ms after querying"
+      if $self->started_iterating;
+
+    $self->_ensure_nested;
+    $self->_query->STORE( '$maxTimeMS', $num );
+    return $self;
+
+}
 
 =head2 tailable ($bool)
 
@@ -389,14 +476,16 @@ sub snapshot {
     confess "cannot set snapshot after querying"
 	if $self->started_iterating;
 
-    $self->_ensure_special;
-    $self->_query->{'$snapshot'} = 1;
+    $self->_ensure_nested;
+    $self->_query->STORE('$snapshot', 1);
     return $self;
 }
 
 =head2 hint
 
     my $cursor = $coll->query->hint({'x' => 1});
+    my $cursor = $coll->query->hint(['x', 1]);
+    my $cursor = $coll->query->hint('x_1');
 
 Force Mongo to use a specific index for a query.
 
@@ -405,12 +494,20 @@ Force Mongo to use a specific index for a query.
 sub hint {
     my ($self, $index) = @_;
     confess "cannot set hint after querying"
-	if $self->started_iterating;
-    confess 'not a hash reference'
-    	unless ref $index eq 'HASH' || ref $index eq 'Tie::IxHash';
+        if $self->started_iterating;
 
-    $self->_ensure_special;
-    $self->_query->{'$hint'} = $index;
+    # $index must either be a string or a reference to an array, hash, or IxHash
+    if (ref $index eq 'ARRAY') {
+
+        $index = Tie::IxHash->new(@$index);
+
+    } elsif (ref $index && !(ref $index eq 'HASH' || ref $index eq 'Tie::IxHash')) {
+
+        confess 'not a hash reference';
+    }
+
+    $self->_ensure_nested;
+    $self->_query->STORE('$hint', $index);
     return $self;
 }
 
@@ -432,18 +529,20 @@ L<http://dochub.mongodb.org/core/explain>.
 
 sub explain {
     my ($self) = @_;
+    confess "cannot explain a parallel scan"
+        if $self->_is_parallel;
     my $temp = $self->_limit;
     if ($self->_limit > 0) {
         $self->_limit($self->_limit * -1);
     }
 
-    $self->_ensure_special;
-    $self->_query->{'$explain'} = boolean::true;
+    $self->_ensure_nested;
+    $self->_query->STORE('$explain', boolean::true);
 
     my $retval = $self->reset->next;
     $self->reset->limit($temp);
 
-    undef $self->_query->{'$explain'};
+    $self->_query->DELETE('$explain');
 
     return $retval;
 }
@@ -462,11 +561,14 @@ used in calculating the count.
 sub count {
     my ($self, $all) = @_;
 
+    confess "cannot count a parallel scan"
+        if $self->_is_parallel;
+
     my ($db, $coll) = $self->_ns =~ m/^([^\.]+)\.(.*)/;
     my $cmd = new Tie::IxHash(count => $coll);
 
-    if ($self->_grrrr) {
-        $cmd->Push(query => $self->_query->{'query'});
+    if ($self->_query->EXISTS('$query')) {
+        $cmd->Push(query => $self->_query->FETCH('$query'));
     }
     else {
         $cmd->Push(query => $self->_query);
@@ -477,11 +579,30 @@ sub count {
         $cmd->Push(skip => $self->_skip) if $self->_skip;
     }
 
-    my $result = $self->_client->get_database($db)->run_command($cmd);
+    if ($self->_query->EXISTS('$hint')) {
+        $cmd->Push(hint => $self->_query->FETCH('$hint'));
+    }
 
-    # returns "ns missing" if collection doesn't exist
-    return 0 unless ref $result eq 'HASH';
-    return $result->{'n'};
+    my $result;
+
+    try {
+        $result = $self->_client->get_database($db)->_try_run_command($cmd);
+    }
+    catch {
+
+        # if there was an error, check if it was the "ns missing" one that means the
+        # collection hasn't been created or a real error.
+        die $_ unless /^ns missing/;
+    };
+
+    return $result ? $result->{n} : 0;
+}
+
+
+sub _add_readpref {
+    my ($self, $prefdoc) = @_;
+    $self->_ensure_nested;
+    $self->_query->STORE('$readPreference', $prefdoc);
 }
 
 
@@ -496,6 +617,11 @@ sub _inflate_dbrefs {
     return $self->_client->inflate_dbrefs;
 }
 
+sub _inflate_regexps { 
+    my $self = shift;
+    return $self->_client->inflate_regexps;
+}
+
 
 =head2 reset
 
@@ -503,6 +629,14 @@ Resets the cursor.  After being reset, pre-query methods can be
 called on the cursor (sort, limit, etc.) and subsequent calls to
 next, has_next, or all will re-query the database.
 
+=cut
+
+sub reset {
+    my ($self) = @_;
+    confess "cannot reset a parallel scan"
+        if $self->_is_parallel;
+    return $self->_reset;
+}
 
 =head2 has_next
 
@@ -571,6 +705,32 @@ sub all {
     }
 
     return @ret;
+}
+
+=head2 read_preference ($mode, $tagsets)
+
+    my $cursor = $coll->find()->read_preference(MongoDB::MongoClient->PRIMARY_PREFERRED, [{foo => 'bar'}]);
+
+Sets read preference for the cursor's connection. The $mode argument
+should be a constant in MongoClient (PRIMARY, PRIMARY_PREFERRED, SECONDARY,
+SECONDARY_PREFERRED). The $tagsets specify selection criteria for secondaries
+in a replica set and should be an ArrayRef whose array elements are HashRefs.
+This is a convenience method which is identical in function to
+L<MongoDB::MongoClient/read_preference>.
+In order to use read preference, L<MongoDB::MongoClient/find_master> must be set.
+For core documentation on read preference see L<http://docs.mongodb.org/manual/core/read-preference/>.
+
+Returns $self so that this method can be chained.
+
+=cut
+
+sub read_preference {
+    my ($self, $mode, $tagsets) = @_;
+
+    $self->_master->read_preference($mode, $tagsets);
+
+    $self->_client($self->_master->_readpref_pinned);
+    return $self;
 }
 
 

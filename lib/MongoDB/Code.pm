@@ -19,6 +19,9 @@ package MongoDB::Code;
 
 # ABSTRACT: JavaScript Code
 
+use version;
+our $VERSION = 'v0.704.5.1';
+
 =head1 NAME
 
 MongoDB::Code - JavaScript code
@@ -26,6 +29,7 @@ MongoDB::Code - JavaScript code
 =cut
 
 use Moose;
+use namespace::clean -except => 'meta';
 
 =head1 ATTRIBUTES
 
@@ -52,5 +56,7 @@ has scope => (
     isa      => 'HashRef',
     required => 0,
 );
+
+__PACKAGE__->meta->make_immutable;
 
 1;

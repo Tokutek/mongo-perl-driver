@@ -19,11 +19,19 @@
 
 #define PERL_GCC_BRACE_GROUPS_FORBIDDEN
 
+#include <bson.h>
 #include "EXTERN.h"
 #include "perl.h"
 #include "XSUB.h"
 
 #include "ppport.h"
+
+/* not yet provided by ppport.h */
+#ifndef HeUTF8
+#define HeUTF8(he)  ((HeKLEN(he) == HEf_SVKEY) ? \
+                    SvUTF8(HeKEY_sv(he)) :       \
+                    (U32)HeKUTF8(he))
+#endif
 
 #define PERL_MONGO_CALL_BOOT(name)  perl_mongo_call_xs (aTHX_ name, cv, mark)
 
@@ -59,9 +67,6 @@ typedef __int64 int64_t;
 
 #define MONGO_32(b) (BYTE4_32(b) | BYTE3_32(b) | BYTE2_32(b) | BYTE1_32(b))
 
-#define MONGO_32p(b) (((int)((unsigned char)b[0])) | ((int)((unsigned char)b[1]) << 8) | \
-                      ((int)((unsigned char)b[2]) << 16) | ((int)((unsigned char)b[3]) << 24))
-
 #define BYTE1_64(b) ((b & 0xff00000000000000ll) >> 56)
 #define BYTE2_64(b) ((b & 0x00ff000000000000ll) >> 40)
 #define BYTE3_64(b) ((b & 0x0000ff0000000000ll) >> 24)
@@ -74,17 +79,10 @@ typedef __int64 int64_t;
 #define MONGO_64(b) (BYTE8_64(b) | BYTE7_64(b) | BYTE6_64(b) | BYTE5_64(b) | \
                      BYTE4_64(b) | BYTE3_64(b) | BYTE2_64(b) | BYTE1_64(b))
 
-#define MONGO_64p(b) (((int64_t)((unsigned char)b[0])) | ((int64_t)((unsigned char)b[1]) << 8) | \
-                      ((int64_t)((unsigned char)b[2]) << 16) | ((int64_t)((unsigned char)b[3]) << 24) | \
-                      ((int64_t)((unsigned char)b[4]) << 32) | ((int64_t)((unsigned char)b[5]) << 40) | \
-                      ((int64_t)((unsigned char)b[6]) << 48) | ((int64_t)((unsigned char)b[7]) << 56))
-
 #else
 #define MONGO_32(b) (b)
-#define MONGO_32p(b) *((int*)(b))
 
 #define MONGO_64(b) (b)
-#define MONGO_64p(b) *((int64_t*)(b))
 #endif
 
 
@@ -144,7 +142,6 @@ typedef struct _stackette {
 #define perl_mongo_serialize_bool(buf, b) perl_mongo_serialize_byte(buf, (char)b)
 
 extern MGVTBL connection_vtbl, cursor_vtbl;
-extern int perl_mongo_machine_id;
 
 int isUTF8(const char*, int);
 void perl_mongo_init();
@@ -153,26 +150,21 @@ SV *perl_mongo_call_reader (SV *self, const char *reader);
 SV *perl_mongo_call_method (SV *self, const char *method, I32 flags, int num, ...);
 SV *perl_mongo_call_function (const char *func, int num, ...);
 void perl_mongo_attach_ptr_to_instance (SV *self, void *ptr, MGVTBL *vtbl);
+void *perl_mongo_maybe_get_ptr_from_instance (SV *self, MGVTBL *vtbl);
 void *perl_mongo_get_ptr_from_instance (SV *self, MGVTBL *vtbl);
 SV *perl_mongo_construct_instance (const char *klass, ...);
 SV *perl_mongo_construct_instance_va (const char *klass, va_list ap);
 SV *perl_mongo_construct_instance_with_magic (const char *klass, void *ptr, MGVTBL *vtbl, ...);
 
-void perl_mongo_make_id(char *id);
-void perl_mongo_make_oid(char* twelve, char *twenty4);
-
 // serialization
-SV *perl_mongo_bson_to_sv (buffer *buf, char *dt_type, int inflate_dbrefs, SV *client );
-void perl_mongo_sv_to_bson (buffer *buf, SV *sv, AV *ids);
+SV *perl_mongo_buffer_to_sv(buffer * buffer, char * dt_type, int inflate_dbrefs, int inflate_regexps, SV * client);
+SV *perl_mongo_bson_to_sv (const bson_t * bson, char *dt_type, int inflate_dbrefs, int inflate_regexps, SV *client );
+void perl_mongo_sv_to_bson (bson_t * bson, SV *sv, AV *ids);
+void perl_mongo_sv_to_buffer(buffer * buf, SV *sv, AV *ids);
 
-int perl_mongo_resize_buf (buffer*, int);
-void perl_mongo_serialize_key(buffer *buf, const char *str, int is_insert);
-void perl_mongo_serialize_size(char*, buffer*);
-void perl_mongo_serialize_double(buffer*, double);
-void perl_mongo_serialize_string(buffer*, const char*, unsigned int);
-void perl_mongo_serialize_long(buffer*, int64_t);
-void perl_mongo_serialize_int(buffer*, int);
-void perl_mongo_serialize_byte(buffer*, char);
-void perl_mongo_serialize_bytes(buffer*, const char*, unsigned int);
+void perl_mongo_serialize_string(buffer *buf, const char *str, unsigned int str_len);
+void perl_mongo_serialize_int(buffer *buf, int num);
+void perl_mongo_serialize_long(buffer *buf, int64_t num);
+void perl_mongo_serialize_size(char *start, buffer *buf);
 
 #endif

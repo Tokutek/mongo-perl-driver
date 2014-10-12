@@ -18,7 +18,13 @@ package MongoDB::BSON;
 
 
 # ABSTRACT: Tools for serializing and deserializing data in BSON form
+
+use version;
+our $VERSION = 'v0.704.5.1';
+
 use Moose;
+use MongoDB;
+use namespace::clean -except => 'meta';
 
 =head1 NAME
 
@@ -102,5 +108,7 @@ you would like to have it deserialized as instances of L<MongoDB::BSON::Binary>
 =cut
 
 $MongoDB::BSON::use_binary = 0;
+
+__PACKAGE__->meta->make_immutable;
 
 1;

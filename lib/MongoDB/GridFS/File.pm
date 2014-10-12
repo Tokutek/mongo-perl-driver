@@ -19,9 +19,13 @@ package MongoDB::GridFS::File;
 
 # ABSTRACT: A Mongo GridFS file
 
-use Moose;
+use version;
+our $VERSION = 'v0.704.5.1';
+
 use MongoDB::GridFS;
 use IO::File;
+use Moose;
+use namespace::clean -except => 'meta';
 
 =head1 NAME
 
@@ -77,7 +81,7 @@ sub print {
     my ($written, $pos) = (0, 0);
     my $start_pos = $fh->getpos();
 
-    $self->_grid->chunks->ensure_index(Tie::IxHash->new(files_id => 1, n => 1));
+    $self->_grid->chunks->ensure_index(Tie::IxHash->new(files_id => 1, n => 1), { safe => 1, unique => 1 });
 
     my $cursor = $self->_grid->chunks->query({"files_id" => $self->info->{"_id"}})->sort({"n" => 1});
 
@@ -147,6 +151,8 @@ sub slurp {
 
     return $bytes;
 }
+
+__PACKAGE__->meta->make_immutable;
 
 1;
 

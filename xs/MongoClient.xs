@@ -163,8 +163,7 @@ connect (self)
      SV *self
    PREINIT:
      mongo_link *link = (mongo_link*)perl_mongo_get_ptr_from_instance(self, &connection_vtbl);
-     SV *username, *password;
-     IV sasl_flag;
+     SV *username, *password, *sasl_flag;
    CODE:
     perl_mongo_connect(self, link);
 
@@ -175,9 +174,9 @@ connect (self)
      // try legacy authentication if we have username and password but are not using SASL 
      username = perl_mongo_call_reader (self, "username");
      password = perl_mongo_call_reader (self, "password");
-     sasl_flag = SvIV( perl_mongo_call_reader( self, "sasl" ) );
+     sasl_flag = perl_mongo_call_reader( self, "sasl" );
 
-     if ( ( sasl_flag == 0 ) && SvPOK(username) && SvPOK(password)) {
+     if ( ( SvIV(sasl_flag) == 0 ) && SvPOK(username) && SvPOK(password)) {
        SV *database, *result, **ok;
 
        database = perl_mongo_call_reader (self, "db_name");
@@ -186,6 +185,7 @@ connect (self)
          SvREFCNT_dec(database);
          SvREFCNT_dec(username);
          SvREFCNT_dec(password);
+         SvREFCNT_dec(sasl_flag);
          croak("authentication returned no result");
        }
        // we're expecting either a string (failure) or a hash (success hopefully)
@@ -193,6 +193,7 @@ connect (self)
          SvREFCNT_dec(database);
          SvREFCNT_dec(username);
          SvREFCNT_dec(password);
+         SvREFCNT_dec(sasl_flag);
          croak("%s", SvPV_nolen(result));
        } else if (SvROK(result)) {
          ok = hv_fetchs((HV*)SvRV(result), "ok", 0);
@@ -200,6 +201,7 @@ connect (self)
            SvREFCNT_dec(database);
            SvREFCNT_dec(username);
            SvREFCNT_dec(password);
+           SvREFCNT_dec(sasl_flag);
            croak ("couldn't authenticate with server");
          }
        } else {
@@ -207,14 +209,17 @@ connect (self)
          SvREFCNT_dec(database);
          SvREFCNT_dec(username);
          SvREFCNT_dec(password);
+         SvREFCNT_dec(sasl_flag);
          croak("something weird happened with authentication");
        }
 
        SvREFCNT_dec(database);
      }
 
+     perl_mongo_call_method(self, "_update_server_attributes", G_DISCARD, 0);
      SvREFCNT_dec(username);
      SvREFCNT_dec(password);
+     SvREFCNT_dec(sasl_flag);
 
 
 int
@@ -255,12 +260,13 @@ send(self, str)
          RETVAL
 
 
-void
+int
 recv(self, cursor)
-         SV *cursor
-     CODE:
-         mongo_link_hear(cursor);
-
+        SV *cursor
+    CODE:
+        RETVAL = mongo_link_hear(cursor);
+    OUTPUT:
+        RETVAL
 
 SV *
 _compile_flags(self)
@@ -273,7 +279,7 @@ _compile_flags(self)
 #ifdef MONGO_SASL
         hv_store( flags, "--sasl", 6, newSViv( 1 ), 0 );
 #endif
-        RETVAL = newRV_noinc( flags );
+        RETVAL = newRV_noinc((SV *) flags );
     OUTPUT:
         RETVAL
 
@@ -284,8 +290,8 @@ DESTROY (self)
      PREINIT:
          mongo_link *link;
      CODE:
-         link = (mongo_link*)perl_mongo_get_ptr_from_instance(self, &connection_vtbl);
+         link = (mongo_link*)perl_mongo_maybe_get_ptr_from_instance(self, &connection_vtbl);
 
-         if (!link->copy && link->master) {
+         if (link && !link->copy && link->master) {
            set_disconnected(self);
          }
